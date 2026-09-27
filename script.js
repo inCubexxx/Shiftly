@@ -16,10 +16,15 @@ const SLOT_MIN = 15; // シフト自動作成エンジンが扱う最小時間�
    ・不足なしは希望休と同格の優先度（不足を埋めるためなら連勤3日以内を緩めることがある）
    ・連勤3日以内（4連勤以上を避ける）は最も優先度の低いガイドライン */
 const MAX_CONSECUTIVE_WORK_DAYS = 3; // これを超える連勤（4連勤以上）は避ける。ただし不足なしの方が優先
-const MAX_CONSECUTIVE_WORK_DAYS_OVERRIDE_BY_EMP_NO = {
+/* ---------- 個人ごとのルールの目印（ruleKey） ----------
+   個人ごとの特別ルールは、社員番号ではなく各ユーザーの ruleKey で判定する。
+   社員番号は管理者が後から変更できるため、社員番号で判定すると番号を変えた人のルールが効かなくなる。
+   ruleKey は一度記録したら変わらない値（既存の人は記録した時点の社員番号、新しく追加した人は内部ID）。 */
+const ruleKeyOf = u => u && (u.ruleKey || u.id);
+const MAX_CONSECUTIVE_WORK_DAYS_OVERRIDE_BY_RULE_KEY = {
   // 個人ごとの連勤上限の例外は現在なし（全員一律で3連勤まで。人員不足を避けるためだけ4連勤まで緩和する）
 };
-const maxConsecutiveFor = u => (u && MAX_CONSECUTIVE_WORK_DAYS_OVERRIDE_BY_EMP_NO[u.empNo]) || MAX_CONSECUTIVE_WORK_DAYS;
+const maxConsecutiveFor = u => (u && MAX_CONSECUTIVE_WORK_DAYS_OVERRIDE_BY_RULE_KEY[ruleKeyOf(u)]) || MAX_CONSECUTIVE_WORK_DAYS;
 const MIN_SHIFT_MIN = 3*60; // 1日の拘束時間（出勤〜退勤、1本の連続勤務）はこれ以上でなければならない（3時間未満は不可。3時間ちょうどはOK）
 const DOW=['日','月','火','水','木','金','土'];
 const roleLabel = r => r==='admin' ? '管理者' : '従業員';
@@ -31,15 +36,15 @@ const isStaff = u => !!u.permission; // PA種別を持つ人がシフト対象�
    ・水上さん（社員番号17833）は平日30分固定・土曜出勤は休憩なし（個人ルールが優先）
    ・金子さん・小林さん・星山さんは、本来45分になる休憩を50分に延長（個人ルールが優先）
    ・週の判定と同じく、ここでの「時間」はその日の実働（休憩を除く勤務）時間 */
-const MIZUKAMI_EMP_NO = '17833';
-const EXTENDED_45MIN_BREAK_EMP_NOS = new Set(['17649','44165','75643']); // 金子・小林・星山: 45分→50分
+const MIZUKAMI_RULE_KEY = '17833';
+const EXTENDED_45MIN_BREAK_RULE_KEYS = new Set(['17649','44165','75643']); // 金子・小林・星山: 45分→50分
 function breakMinutesFor(u, dateIso, workMin){
   if(!workMin || workMin<=0) return 0;
-  if(u && u.empNo===MIZUKAMI_EMP_NO){
+  if(u && ruleKeyOf(u)===MIZUKAMI_RULE_KEY){
     return dowOf(dateIso)===6 ? 0 : 30; // 土曜出勤は休憩なし、それ以外は30分固定
   }
   if(workMin>=8*60) return 60;
-  if(workMin>=6*60) return (u && EXTENDED_45MIN_BREAK_EMP_NOS.has(u.empNo)) ? 50 : 45;
+  if(workMin>=6*60) return (u && EXTENDED_45MIN_BREAK_RULE_KEYS.has(ruleKeyOf(u))) ? 50 : 45;
   return 0;
 }
 
@@ -48,13 +53,13 @@ function breakMinutesFor(u, dateIso, workMin){
    ・星山さん（社員番号75643）：基本は10:00〜16:00を優先
    ・あくまで優先ヒントであり絶対条件ではない。人員不足を避けることの方が優先なので、
      必要なら指定時間の外でも、また指定時間の人がいなくても他の人で割り当てる。 */
-const PREFERRED_HOURS_BY_EMP_NO = {
+const PREFERRED_HOURS_BY_RULE_KEY = {
   '19111': {start:'12:00', end:'20:30'}, // 長井さん
   '75643': {start:'10:00', end:'16:00'}, // 星山さん
 };
 // 候補者ソート用のランク: 0=指定時間内（優先） / 1=指定なし（中立） / 2=指定時間外（できれば避ける）
 function preferredHoursRank(u, slotStart, slotEnd){
-  const pref = u && PREFERRED_HOURS_BY_EMP_NO[u.empNo];
+  const pref = u && PREFERRED_HOURS_BY_RULE_KEY[ruleKeyOf(u)];
   if(!pref) return 1;
   return (toMin(pref.start)<=slotStart && toMin(pref.end)>=slotEnd) ? 0 : 2;
 }
@@ -141,15 +146,24 @@ DB.breaks=DB.breaks||[]; // 旧データ互換
     seeded.push(d.empNo); changed=true;
     if(DB.users.some(u=>u.empNo===d.empNo)) return;
     if(i===0){
-      DB.users.push({id:'u_default_admin', name:d.name, empNo:d.empNo, password:'cc5xd3dP', mustSetPassword:false,
+      DB.users.push({id:'u_default_admin', name:d.name, empNo:d.empNo, ruleKey:d.empNo, password:'cc5xd3dP', mustSetPassword:false,
         role:'admin', owner:true, permission:'dependent_student', is_active:true});
     } else {
-      DB.users.push({id:'u_default_'+d.empNo, name:d.name, empNo:d.empNo, password:null, mustSetPassword:true,
+      DB.users.push({id:'u_default_'+d.empNo, name:d.name, empNo:d.empNo, ruleKey:d.empNo, password:null, mustSetPassword:true,
         role:'employee', permission:'general', is_active:true});
     }
     changed=true;
   });
   if(changed) save();
+})();
+// 社員番号を変更できるようにする前のデータには ruleKey が無いので、その時点の社員番号を一度だけ記録する。
+// （この時点ではまだ誰も番号を変えていないので、社員番号＝個人ルールの目印として正しい）
+// 一度だけにしないと、あとで追加した人にも社員番号が ruleKey として入ってしまうので、済んだ印を残す。
+(function migrateRuleKeys(){
+  if(DB.settings._ruleKeysMigrated) return;
+  DB.users.forEach(u=>{ if(!u.ruleKey) u.ruleKey=u.empNo; });
+  DB.settings._ruleKeysMigrated=true;
+  save();
 })();
 // 氏名が「管理者」のアカウントを削除（依頼によるクリーンアップ）
 (function purgeNamedAdmin(){
@@ -424,7 +438,7 @@ function signupAdminSubmit(){
   if(pw!==pw2){ signupError='パスワードが一致しません。'; render(); return; }
   const id='u_'+Date.now().toString(36);
   const empNo=genEmpNo();
-  DB.users.push({id,name,empNo,password:pw,role:'admin',is_active:true,owner:true});
+  DB.users.push({id,name,empNo,ruleKey:id,password:pw,role:'admin',is_active:true,owner:true});
   DB.settings.org_name=signupDraft.org;
   save();
   signupError=''; authScreen='login';
@@ -539,16 +553,16 @@ function generateShifts(){
 
   // 9:30〜10:00は1人（立ち上げ番を優先）、20:00〜20:30は2人（閉め番を優先）を超えない。
   // ラベル（立ち上げ番・閉め番）が同時に複数人につく日は、削られる人が公平ローテーションの
-  // 巡り合わせで毎回変わってしまうと不公平感が出るため、priorityEmpNosで固定の優先順位を
+  // 巡り合わせで毎回変わってしまうと不公平感が出るため、priorityRuleKeysで固定の優先順位を
   // つける（リストに無い人はラベルが付いていても優先順位は一番低い扱いになる）。
   const capWindows=[
     {start:'09:30', end:'10:00', max:1, edge:'start', preferLabel:'openingDuty',
-      priorityEmpNos:['17649','44165','75643']}, // 金子＞小林＞星山
+      priorityRuleKeys:['17649','44165','75643']}, // 金子＞小林＞星山
     {start:'20:00', end:'20:30', max:2, edge:'end', preferLabel:'closingDuty',
-      priorityEmpNos:['19111','9643','51180']}, // 長井＞鈴木＞寺嶋
+      priorityRuleKeys:['19111','9643','51180']}, // 長井＞鈴木＞寺嶋
   ];
   const priorityRank=(u,cw)=>{
-    const idx=(cw.priorityEmpNos||[]).indexOf(u.empNo);
+    const idx=(cw.priorityRuleKeys||[]).indexOf(ruleKeyOf(u));
     return idx===-1 ? 999 : idx;
   };
 
@@ -1123,13 +1137,13 @@ function viewEmps(){
   return `
   <div class="card">
     <h2><span class="tag">4-1</span> 従業員管理機能</h2>
-    <p class="desc">従業員の追加・編集・削除を行います。管理項目：氏名、ログイン情報、役職、権限（PA種別）、在籍状況。社員番号は追加時に自動発行され、変更できません。パスワードは本人が初回ログイン時に設定します。<br>
+    <p class="desc">従業員の追加・編集・削除を行います。管理項目：氏名、ログイン情報、役職、権限（PA種別）、在籍状況。社員番号は追加時に自動発行されます。あとから管理者が変更することもできます（数字5桁以内・他の人と重複しない番号）。変更した場合、本人は次回から新しい番号でログインします。パスワードは本人が初回ログイン時に設定します。<br>
       管理者アカウント（登録者を含む）も削除できます。ただし、ログイン中の自分のアカウントと、ログインできる最後の1人の管理者は削除できません。</p>
     <div class="scroll"><table id="empTable">
       <tr><th>氏名</th><th>社員番号</th><th>パスワード</th><th>役職</th><th>権限（PA種別）</th><th>在籍</th><th>立ち上げ番</th><th>閉め番</th><th></th></tr>
       ${DB.users.map(u=>`<tr>
         <td><input value="${u.name}" onchange="editUser('${u.id}','name',this.value)"></td>
-        <td><input value="${u.empNo}" readonly disabled></td>
+        <td><input value="${u.empNo}" inputmode="numeric" maxlength="5" style="width:6em" onchange="editUser('${u.id}','empNo',this.value)"></td>
         <td><input value="${u.password||''}" placeholder="${u.mustSetPassword?'（初回ログインで本人が設定）':''}" onchange="editUser('${u.id}','password',this.value)"></td>
         <td>${u.owner
           ? `管理者 <span class="pill muted">登録者</span>`
@@ -1166,10 +1180,18 @@ function editUser(id,f,val){ const u=DB.users.find(x=>x.id===id);
   if(((f==='role' && val!=='admin') || (f==='is_active' && !val)) && isLastActiveAdmin(u)){
     alert('ログインできる管理者が1人もいなくなるため、変更できません。先に別の管理者を追加してください。'); render(); return;
   }
+  if(f==='empNo'){
+    // 社員番号はログインに使うので、ログイン画面で入力できる形（数字5桁以内）で、他の人と重複しないこと
+    val=String(val).trim();
+    if(val===u.empNo) return;
+    if(!/^[0-9]{1,5}$/.test(val)){ alert('社員番号は数字5桁以内で入力してください。'); render(); return; }
+    if(DB.users.some(x=>x.id!==u.id && x.empNo===val)){ alert(`社員番号「${val}」はすでに他の人が使っています。`); render(); return; }
+    if(!confirm(`「${u.name}」さんの社員番号を「${u.empNo}」から「${val}」に変更しますか？\n次回から新しい番号でログインすることになります。本人に伝えてください。`)){ render(); return; }
+  }
   if(f==='permission' && val==='') val=null;
   u[f]=val;
   if(f==='password' && val){ u.mustSetPassword=false; } // 管理者が直接パスワードを設定した場合は初回設定フローを解除
-  save(); if(f==='role'||f==='name'||f==='is_active'||f==='permission'||f==='password'||f==='closingDuty'||f==='openingDuty') render(); }
+  save(); if(f==='empNo'||f==='role'||f==='name'||f==='is_active'||f==='permission'||f==='password'||f==='closingDuty'||f==='openingDuty') render(); }
 // 従業員・管理者（登録者を含む）のアカウントを削除する。
 // ただし、ログイン中の自分自身と、ログインできる最後の管理者は削除できない（管理画面に誰も入れなくなるのを防ぐ）。
 function delUser(id){ const t=DB.users.find(x=>x.id===id);
@@ -1188,7 +1210,8 @@ function delUser(id){ const t=DB.users.find(x=>x.id===id);
   save(); render(); }
 function addUser(){ const n=document.getElementById('newName').value.trim(); if(!n){alert('氏名を入力してください');return;}
   const empNo=genEmpNo();
-  DB.users.push({id:'u_'+Date.now(),name:n,empNo,password:null,mustSetPassword:true,role:'employee',permission:'general',is_active:true,openingDuty:false,closingDuty:false});
+  const id='u_'+Date.now();
+  DB.users.push({id,name:n,empNo,ruleKey:id,password:null,mustSetPassword:true,role:'employee',permission:'general',is_active:true,openingDuty:false,closingDuty:false});
   save(); render();
   alert(`「${n}」さんの社員番号は「${empNo}」です。権限は一旦「一般PA」です。\n初回ログイン時に社員番号を入力するとパスワード設定画面が表示されるので、本人に設定してもらってください。`); }
 
@@ -1376,7 +1399,7 @@ function unpublishLatest(){
 
 /* ---------- 管理者/共通: シフトカレンダー ---------- */
 function viewCal(){ return calendarHTML(true); }
-const TERASHIMA_EMP_NO = '51180', SUZUKI_EMP_NO = '9643';
+const TERASHIMA_RULE_KEY = '51180', SUZUKI_RULE_KEY = '9643';
 // カレンダーで切り替えられる期間の一覧：作成中の対象期間 ＋ 公開済みの期間（新しい順）
 function calendarPeriodOptions(){
   const s=DB.settings;
@@ -1400,8 +1423,8 @@ function calendarHTML(editable){
   // 表示順: 寺嶋を鈴木の直後に表示する（それ以外は元の並び順のまま）
   emps.sort((a,b)=>{
     const idx=u=>{
-      if(u.empNo===TERASHIMA_EMP_NO){
-        const suzuki=DB.users.find(x=>x.empNo===SUZUKI_EMP_NO);
+      if(ruleKeyOf(u)===TERASHIMA_RULE_KEY){
+        const suzuki=DB.users.find(x=>ruleKeyOf(x)===SUZUKI_RULE_KEY);
         if(suzuki) return DB.users.indexOf(suzuki)+0.5;
       }
       return DB.users.indexOf(u);
