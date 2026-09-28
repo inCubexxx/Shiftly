@@ -1,6 +1,46 @@
 /* ============================================================
-   データ層 (localStorage)
+   データ層 (Firebase / Firestore でみんなと共有)
+   ・店舗全体のデータ（従業員一覧・必要人数・設定・シフト・休憩）… app/main（管理者だけが書き込める）
+   ・従業員ごとの勤務希望 ……………………………………………… prefs/{ユーザーID}（本人と管理者だけ）
+   ・社員番号 → 内部ID（ログイン画面で使う）…………………………… logins/{社員番号}（番号を知っている1件だけ誰でも読める。一覧は取れない）
+   ・初期設定が済んでいるかの印 …………………………………………… app/public（誰でも読める）
+   勤務希望を人ごとに別の場所へ保存するのは、何人かが同時に提出しても、
+   後から保存した人の内容で先に出した人の希望が上書きされて消えないようにするため。
+   画面側のコードは今までどおり DB を書き換えて save() を呼ぶだけでよい（save() が変わった部分だけ送る）。
    ============================================================ */
+// Firebase プロジェクトの接続先。apiKey は「どのプロジェクトにつなぐか」を示す値で、公開しても問題ない
+// （データを守るのは firestore.rules のセキュリティルール）。
+const firebaseConfig = {
+  apiKey: "AIzaSyBv4fN-9-H4yCVtFyaxb1szktYVEy_i3hs",
+  authDomain: "shiftly-b6e52.firebaseapp.com",
+  projectId: "shiftly-b6e52",
+  storageBucket: "shiftly-b6e52.firebasestorage.app",
+  messagingSenderId: "920164464388",
+  appId: "1:920164464388:web:18462acb6a115b42c48251"
+};
+firebase.initializeApp(firebaseConfig);
+const auth=firebase.auth();
+const fs=firebase.firestore();
+// ログイン状態は、タブ（ウィンドウ）を閉じるまで保つ（以前の sessionStorage と同じ動き）
+auth.setPersistence(firebase.auth.Auth.Persistence.SESSION);
+// ログインは社員番号で行うが、Firebase のログイン機能はメールアドレス形式のIDを使うので、
+// 内部ID（変わらない値）からIDを作る。メールが送られることはない。
+// 社員番号から作らないのは、管理者が社員番号を変更してもログインできなくならないようにするため。
+const emailOf = userId => userId+'@'+firebaseConfig.authDomain;
+const userIdOfAuth = user => (user && user.email) ? user.email.split('@')[0] : null;
+// クラウド同期の状態（下の save() などから使う。save() はこの後の移行処理からも呼ばれるので、先に用意しておく）
+const cloud={
+  authKnown:false,     // ログイン状態の確認が終わったか（ページを開いた直後は未確認）
+  ready:false,         // 共有データを読み込み終えたか
+  mainLoaded:false, prefsLoaded:false,
+  mainJson:null,       // 最後にクラウドと一致していた内容（変わった部分だけ送るための比較用）
+  prefsJson:{},        // userId -> 同上
+  logins:{},           // 社員番号 -> 内部ID（同上）
+  mainUnsub:null, prefsUnsub:null, // リアルタイム受信を止める関数
+  prefsAsAdmin:null,   // 勤務希望を「全員分（管理者）」「自分の分」のどちらで受信しているか
+  setupInProgress:false, // 最初の1回のデータ移行中
+};
+
 const KEY='shiftapp_v2'; // v2: 学生ロール（1日7.5h / 週40h 上限）→ v3でPA権限体系に移行
 // PA種別（権限）: 週の上限は月曜始まり〜日曜終わりの週で判定し、「未満」を厳密に守る
 const PA_TYPES = {
@@ -146,10 +186,10 @@ DB.breaks=DB.breaks||[]; // 旧データ互換
     seeded.push(d.empNo); changed=true;
     if(DB.users.some(u=>u.empNo===d.empNo)) return;
     if(i===0){
-      DB.users.push({id:'u_default_admin', name:d.name, empNo:d.empNo, ruleKey:d.empNo, password:'cc5xd3dP', mustSetPassword:false,
+      DB.users.push({id:'u_default_admin', name:d.name, empNo:d.empNo, ruleKey:d.empNo,
         role:'admin', owner:true, permission:'dependent_student', is_active:true});
     } else {
-      DB.users.push({id:'u_default_'+d.empNo, name:d.name, empNo:d.empNo, ruleKey:d.empNo, password:null, mustSetPassword:true,
+      DB.users.push({id:'u_default_'+d.empNo, name:d.name, empNo:d.empNo, ruleKey:d.empNo,
         role:'employee', permission:'general', is_active:true});
     }
     changed=true;
@@ -243,18 +283,178 @@ DB.breaks=DB.breaks||[]; // 旧データ互換
   delete s.published; delete s.published_at;
   save();
 })();
-function load(){ try{const r=localStorage.getItem(KEY); if(r) return JSON.parse(r);}catch(e){} const s=seed(); localStorage.setItem(KEY,JSON.stringify(s)); return s; }
-function save(){ localStorage.setItem(KEY,JSON.stringify(DB)); }
-function resetAll(){ if(confirm('全データを初期状態に戻します。よろしいですか？')){ DB=seed(); save(); render(); } }
+// この端末に残っている、クラウド化する前のデータ（無ければ初期データ）。
+// クラウドがまだ空のとき、最初にログインした管理者がこれをクラウドへ移す（uploadLocalData）。
+const LOCAL_DB=JSON.parse(JSON.stringify(DB));
+function load(){ try{const r=localStorage.getItem(KEY); if(r) return JSON.parse(r);}catch(e){} return seed(); }
+// 全データを初期状態に戻す。従業員アカウントまで消すと誰もログインできなくなるので、従業員一覧は残す。
+function resetAll(){ if(confirm('全データを初期状態に戻します（従業員アカウントは残します）。よろしいですか？')){ const users=DB.users; DB=seed(); DB.users=users; save(); render(); } }
 
-// 別タブ・別ウィンドウで従業員が希望を提出したりデータを更新したりした場合、
-// このタブが開きっぱなしのままだと反映されない（管理者画面が「未提出」のままに見える）。
-// 同一ブラウザの他タブでの保存を検知したら、このタブのDBを読み直して再描画する。
-window.addEventListener('storage', (e)=>{
-  if(e.key!==KEY || !e.newValue) return;
-  try{ DB = JSON.parse(e.newValue); }catch(err){ return; }
+/* ---------- クラウド同期 ---------- */
+const MAIN_KEYS=['users','required_staff','settings','shifts','breaks']; // app/main に入れる項目
+// 中身が同じなら同じ文字列になるようにする（キーの並び順を揃える）。
+// Firestore から戻ってきたデータはキーの順番が変わることがあり、普通の JSON.stringify だと
+// 「中身は同じなのに違う」と判定して無駄な保存や再描画が起きてしまうため。
+function stableStringify(v){
+  if(Array.isArray(v)) return '['+v.map(stableStringify).join(',')+']';
+  if(v && typeof v==='object') return '{'+Object.keys(v).sort().filter(k=>v[k]!==undefined)
+    .map(k=>JSON.stringify(k)+':'+stableStringify(v[k])).join(',')+'}';
+  return JSON.stringify(v===undefined ? null : v);
+}
+// Firestore は undefined を保存できないので、JSON を通して取り除いたコピーを作る
+function clean(o){ return JSON.parse(JSON.stringify(o)); }
+
+// 送る形に切り出す（src は DB か、この端末の古いデータ LOCAL_DB）
+function mainPartOf(src){
+  const o={};
+  MAIN_KEYS.forEach(k=>{ if(src[k]!==undefined) o[k]=src[k]; });
+  o.users=(src.users||[]).map(({password,mustSetPassword,...u})=>u); // パスワードは Firebase 側で管理するので送らない
+  return clean(o);
+}
+// セキュリティルールで使う「管理者」「利用できる人」の一覧を添えて app/main に書き込む形にする
+function mainDocOf(part){
+  return {...part,
+    admins: part.users.filter(u=>u.role==='admin' && u.is_active).map(u=>u.id),
+    members: part.users.filter(u=>u.is_active).map(u=>u.id)};
+}
+// 社員番号 → 内部ID の対応（在籍中の人だけ）。クラウドには logins/{社員番号} に1件ずつ置く
+function loginsOf(src){
+  const m={};
+  (src.users||[]).filter(u=>u.is_active).forEach(u=>{ m[u.empNo]=u.id; });
+  return m;
+}
+function prefsPartOf(src,uid){
+  const o={};
+  const p=(src.employee_preferences||{})[uid]; if(p && Object.keys(p).length) o.employee_preferences=p;
+  const d=(src.default_availability||{})[uid]; if(d && Object.keys(d).length) o.default_availability=d;
+  const sub=(src.submissions||{})[uid]; if(sub) o.submission=sub;
+  return clean(o);
+}
+
+// 変わった部分だけクラウドへ送る。画面側はデータを書き換えたら今までどおり save() を呼ぶだけ。
+function save(){
+  if(!cloud.ready) return; // ログイン前・読み込み前は送らない
+  const me=currentUser(); if(!me) return;
+  const admin=me.role==='admin';
+  if(admin){
+    const main=mainPartOf(DB), json=stableStringify(main);
+    if(json!==cloud.mainJson){ cloud.mainJson=json; cloudWrite(fs.doc('app/main').set(mainDocOf(main))); }
+    // 社員番号の追加・変更・在籍の変更があった分だけ logins を書き換える
+    const logins=loginsOf(DB);
+    Object.keys({...cloud.logins, ...logins}).forEach(no=>{
+      if(cloud.logins[no]===logins[no]) return;
+      const ref=fs.doc('logins/'+no);
+      cloudWrite(logins[no] ? ref.set({uid:logins[no]}) : ref.delete());
+    });
+    cloud.logins=logins;
+  }
+  // 勤務希望：従業員は自分の分だけ、管理者は全員分（削除した人の分は消す）
+  const ids = admin ? [...new Set([...Object.keys(cloud.prefsJson), ...DB.users.map(u=>u.id)])] : [me.id];
+  ids.forEach(uid=>{
+    const part = DB.users.some(u=>u.id===uid) ? prefsPartOf(DB,uid) : {};
+    const json=stableStringify(part);
+    if(json===(cloud.prefsJson[uid]||'{}')) return;
+    cloud.prefsJson[uid]=json;
+    const ref=fs.doc('prefs/'+uid);
+    cloudWrite(json==='{}' ? ref.delete() : ref.set(part));
+  });
+}
+function cloudWrite(promise){
+  promise.catch(err=>{
+    console.error(err);
+    alert('クラウドへの保存に失敗しました。通信状況を確認して、ページを再読み込みしてください。\n（'+(err.code||err.message)+'）');
+  });
+}
+
+// ログインしたら、共有データのリアルタイム受信を始める（他の人が変更すると自動で届く）
+function startCloudSync(){
+  stopCloudSync();
+  Object.assign(cloud,{ready:false, mainLoaded:false, prefsLoaded:false, mainJson:null, prefsJson:{}, logins:{}, prefsAsAdmin:null});
+  DB=seed(); // 読み込み終わるまでは空のデータ（前にログインしていた人のデータを残さない）
+  cloud.mainUnsub=fs.doc('app/main').onSnapshot(onMainSnapshot, cloudReadError);
+}
+function stopCloudSync(){
+  if(cloud.mainUnsub){ cloud.mainUnsub(); cloud.mainUnsub=null; }
+  if(cloud.prefsUnsub){ cloud.prefsUnsub(); cloud.prefsUnsub=null; }
+  cloud.ready=false;
+}
+function onMainSnapshot(snap){
+  if(!snap.exists){
+    if(cloud.setupInProgress) return;
+    cloudReadError(appError('まだ初期設定が済んでいません。最初に管理者がログインしてください。')); return;
+  }
+  const part=mainPartOf(snap.data()), json=stableStringify(part);
+  const changed = json!==cloud.mainJson; // 自分が送った内容が戻ってきただけなら何もしない
+  if(changed){
+    Object.assign(DB, part);
+    DB.breaks=DB.breaks||[]; DB.shifts=DB.shifts||[]; DB.required_staff=DB.required_staff||[];
+    cloud.mainJson=json;
+    cloud.logins=loginsOf(DB); // logins は app/main の従業員一覧と同じ内容で保存されている
+  }
+  const me=currentUser();
+  if(!me || !me.is_active){ cloudReadError({code:'permission-denied'}); return; }
+  cloud.mainLoaded=true;
+  const asAdmin = me.role==='admin';
+  if(cloud.prefsAsAdmin!==asAdmin){ subscribePrefs(asAdmin); return; } // 勤務希望を読み込み終えてから描画する
+  if(changed) refreshAfterCloud();
+}
+function subscribePrefs(asAdmin){
+  if(cloud.prefsUnsub) cloud.prefsUnsub();
+  cloud.prefsAsAdmin=asAdmin; cloud.prefsLoaded=false;
+  if(asAdmin){
+    cloud.prefsUnsub=fs.collection('prefs').onSnapshot(qs=>{
+      let changed=false;
+      qs.docChanges().forEach(c=>{ changed = applyPrefsDoc(c.doc.id, c.type==='removed' ? null : c.doc.data()) || changed; });
+      prefsLoaded(changed);
+    }, cloudReadError);
+  } else {
+    cloud.prefsUnsub=fs.doc('prefs/'+currentUserId).onSnapshot(snap=>{
+      prefsLoaded(applyPrefsDoc(currentUserId, snap.exists ? snap.data() : null));
+    }, cloudReadError);
+  }
+}
+// 1人分の勤務希望を DB に反映する。内容が変わっていれば true
+function applyPrefsDoc(uid,data){
+  const part=clean(data||{}), json=stableStringify(part);
+  if(json===(cloud.prefsJson[uid]||'{}')) return false;
+  cloud.prefsJson[uid]=json;
+  if(part.employee_preferences) DB.employee_preferences[uid]=part.employee_preferences; else delete DB.employee_preferences[uid];
+  if(part.default_availability) DB.default_availability[uid]=part.default_availability; else delete DB.default_availability[uid];
+  if(part.submission) DB.submissions[uid]=part.submission; else delete DB.submissions[uid];
+  return true;
+}
+function prefsLoaded(changed){
+  cloud.prefsLoaded=true;
+  if(changed || !cloud.ready) refreshAfterCloud();
+}
+function refreshAfterCloud(){
+  if(cloud.mainLoaded && cloud.prefsLoaded) cloud.ready=true;
   render();
-});
+}
+// 読み込めなかったとき（在籍中でない・削除された・通信エラーなど）はログアウトして理由を表示する
+function cloudReadError(err){
+  console.error(err);
+  stopCloudSync();
+  loginError = err.code==='permission-denied'
+    ? 'このアカウントは現在利用できません（在籍中でない、または削除されています）。管理者に確認してください。'
+    : authErrorMessage(err);
+  auth.signOut();
+}
+
+// クラウドが空のとき（最初の1回だけ）、この端末のデータをまとめてクラウドへ移す。
+// batch（一括書き込み）を使うので、途中で失敗しても中途半端な状態にはならない。
+async function uploadLocalData(){
+  const src=LOCAL_DB;
+  const batch=fs.batch();
+  batch.set(fs.doc('app/main'), mainDocOf(mainPartOf(src)));
+  batch.set(fs.doc('app/public'), {initialized:true}); // 初期設定済みの印（ルールで、2回目以降は書き込めない）
+  Object.entries(loginsOf(src)).forEach(([no,uid])=>batch.set(fs.doc('logins/'+no), {uid}));
+  (src.users||[]).forEach(u=>{
+    const p=prefsPartOf(src,u.id);
+    if(Object.keys(p).length) batch.set(fs.doc('prefs/'+u.id), p);
+  });
+  await batch.commit();
+}
 
 /* ============================================================
    日付ユーティリティ
@@ -371,8 +571,7 @@ function availRangeMin(p){
 /* ============================================================
    認証まわり（ログイン画面）
    ============================================================ */
-let currentUserId = sessionStorage.getItem('shiftapp_uid') || null;
-if(currentUserId && !DB.users.find(u=>u.id===currentUserId && u.is_active)) currentUserId=null;
+let currentUserId = null; // ログイン中の人の内部ID（Firebase のログイン状態から決まる。onAuthStateChanged 参照）
 let editingCell = null; // カレンダーでクリック中のセル {userId, date}（シフト表示画面を離れたらnullに戻る）
 let calPeriodKey = 'target';   // シフトカレンダーで表示中の期間（'target'＝作成中の対象期間、それ以外は公開済み期間の 'start_end'）
 let myShiftPeriodKey = null;   // 「自分のシフト確認」で選んでいる公開済み期間の 'start_end'（null＝自動で選ぶ）
@@ -386,121 +585,123 @@ function genEmpNo(){
   return n;
 }
 let loginError='';
-let authScreen='login';       // 'login' | 'signupOrg' | 'signupAdmin' | 'setPassword'
-let signupError='';
+let authScreen='login';       // 'login' | 'setPassword'
 let pwSetError='';
-let signupDraft={ org:'' };   // 店舗/企業名の一時保持
-let pendingSetupUserId=null;  // 初回パスワード設定中のユーザーID
-function go2Auth(screen){ authScreen=screen; signupError=''; pwSetError=''; render(); }
+let authBusy=false;           // 通信中（ボタンの二度押し防止）
+function go2Auth(screen){ authScreen=screen; loginError=''; pwSetError=''; render(); }
+// エラーの種類ごとに、利用者に見せる文章を決める
+function appError(msg){ return {code:'app/message', message:msg}; }
+function authErrorMessage(e){
+  const c=(e && e.code) || '';
+  if(c==='app/message') return e.message;
+  if(c==='auth/invalid-credential' || c==='auth/invalid-login-credentials' || c==='auth/wrong-password' || c==='auth/user-not-found')
+    return '社員番号またはパスワードが正しくありません。初めてログインする方は「初めてログインする（パスワード設定）」から設定してください。';
+  if(c==='auth/email-already-in-use') return 'この社員番号はすでにパスワードが設定されています。ログイン画面からログインしてください。';
+  if(c==='auth/weak-password') return 'パスワードは6文字以上にしてください。';
+  if(c==='auth/too-many-requests') return 'ログインの失敗が続いたため、一時的にログインできなくなっています。しばらく待ってからやり直してください。';
+  if(c==='auth/network-request-failed' || c==='unavailable') return '通信できませんでした。インターネット接続を確認してください。';
+  if(c==='permission-denied') return 'データにアクセスする権限がありません。Firebase のセキュリティルール（firestore.rules）が公開されているか確認してください。';
+  if(c==='auth/api-key-not-valid.-please-pass-a-valid-api-key.' || c==='auth/invalid-api-key') return 'Firebase の設定（apiKey）が正しくありません。script.js の firebaseConfig を確認してください。';
+  return 'エラーが発生しました（'+(c || (e && e.message) || '不明')+'）';
+}
+// 社員番号から内部IDを調べる。クラウドがまだ空（最初の1回）なら、この端末のデータの管理者だけ通す
+async function lookupLogin(empNo){
+  // 数字以外（「/」など）が入ると保存場所の指定がおかしくなるので、先に形を確かめる
+  if(!/^[0-9]{1,5}$/.test(empNo)) throw appError('社員番号は数字5桁以内で入力してください。');
+  const login=await fs.doc('logins/'+empNo).get();
+  if(login.exists) return {uid:login.data().uid, setup:false};
+  // 初期設定が済んでいるなら、単に番号が違う（済んでいるのに初期設定をやり直すと、クラウドのデータを上書きしてしまう）
+  const pub=await fs.doc('app/public').get();
+  if(pub.exists) throw appError('社員番号またはパスワードが正しくありません。');
+  const u=LOCAL_DB.users.find(x=>x.empNo===empNo && x.role==='admin' && x.is_active);
+  if(!u) throw appError('まだ初期設定が済んでいません。最初に管理者がログインしてください。');
+  return {uid:u.id, setup:true};
+}
+// ログインまたはパスワード設定の共通処理。login には Firebase にログインする関数を渡す
+async function runAuth(errorTarget, login){
+  if(authBusy) return;
+  authBusy=true; loginError=''; pwSetError=''; render();
+  try{
+    await login();
+    activeTab='dash'; // 従業員の場合は、render() で従業員用の最初のタブに切り替わる
+    authScreen='login';
+  }catch(e){
+    console.error(e);
+    if(errorTarget==='login') loginError=authErrorMessage(e); else pwSetError=authErrorMessage(e);
+    if(cloud.setupInProgress){ cloud.setupInProgress=false; auth.signOut(); }
+  }
+  authBusy=false; render();
+}
 function doLogin(){
   const empNo=(document.getElementById('lgEmpNo').value||'').trim();
   const pw=document.getElementById('lgPw').value||'';
-  const u=DB.users.find(x=>x.empNo===empNo);
-  if(!u){ loginError='社員番号またはパスワードが正しくありません。'; render(); return; }
-  if(!u.is_active){ loginError='このアカウントは在籍中ではありません。'; render(); return; }
-  if(u.mustSetPassword){
-    pendingSetupUserId=u.id; loginError=''; pwSetError=''; authScreen='setPassword'; render(); return;
-  }
-  if(u.password!==pw){ loginError='社員番号またはパスワードが正しくありません。'; render(); return; }
-  loginError=''; currentUserId=u.id; sessionStorage.setItem('shiftapp_uid',u.id);
-  activeTab = u.role==='admin' ? 'dash' : 'home';
-  render();
+  if(!empNo || !pw){ loginError='社員番号とパスワードを入力してください。'; render(); return; }
+  runAuth('login', async ()=>{
+    const {uid,setup}=await lookupLogin(empNo);
+    if(setup) cloud.setupInProgress=true;
+    await auth.signInWithEmailAndPassword(emailOf(uid),pw);
+    if(setup) await finishSetup();
+  });
 }
-/* 初回ログイン時のパスワード設定 */
+/* 初回ログイン時のパスワード設定（Firebase にその人のアカウントを作る） */
 function setInitialPassword(){
-  const u=DB.users.find(x=>x.id===pendingSetupUserId);
-  if(!u){ authScreen='login'; render(); return; }
+  const empNo=(document.getElementById('spEmpNo').value||'').trim();
   const pw=document.getElementById('spPw').value||'';
   const pw2=document.getElementById('spPw2').value||'';
-  if(!pw){ pwSetError='パスワードを入力してください。'; render(); return; }
+  if(!empNo){ pwSetError='社員番号を入力してください。'; render(); return; }
+  if(pw.length<6){ pwSetError='パスワードは6文字以上にしてください。'; render(); return; }
   if(pw!==pw2){ pwSetError='パスワードが一致しません。'; render(); return; }
-  u.password=pw; u.mustSetPassword=false; save();
-  pwSetError=''; pendingSetupUserId=null; authScreen='login';
-  currentUserId=u.id; sessionStorage.setItem('shiftapp_uid',u.id);
-  activeTab = u.role==='admin' ? 'dash' : 'home';
-  render();
-  alert('パスワードを設定しました。');
+  runAuth('setPassword', async ()=>{
+    const {uid,setup}=await lookupLogin(empNo);
+    if(setup) cloud.setupInProgress=true;
+    await auth.createUserWithEmailAndPassword(emailOf(uid),pw);
+    if(setup) await finishSetup();
+    alert('パスワードを設定しました。次回からは社員番号とこのパスワードでログインしてください。');
+  });
 }
-function doLogout(){ currentUserId=null; sessionStorage.removeItem('shiftapp_uid'); render(); }
+// 最初の1回：この端末のデータをクラウドへ移してから、受信を始める
+async function finishSetup(){
+  await uploadLocalData();
+  cloud.setupInProgress=false;
+  startCloudSync();
+  alert('この端末のデータをクラウドに移しました。これからは、ほかの人の端末にも同じデータが表示されます。');
+}
+function doLogout(){ auth.signOut(); }
 function quickLogin(empNo,pw){ document.getElementById('lgEmpNo').value=empNo; document.getElementById('lgPw').value=pw; doLogin(); }
 
-/* 新規登録: ① 店舗/企業名 → ② 管理者アカウント */
-function signupOrgNext(){
-  const org=(document.getElementById('suOrg').value||'').trim();
-  if(!org){ signupError='店舗または企業名を入力してください。'; render(); return; }
-  signupDraft.org=org; signupError=''; authScreen='signupAdmin'; render();
-}
-function signupAdminSubmit(){
-  const name=(document.getElementById('suName').value||'').trim();
-  const pw=document.getElementById('suPw').value||'';
-  const pw2=document.getElementById('suPw2').value||'';
-  if(!name||!pw){ signupError='すべての項目を入力してください。'; render(); return; }
-  if(pw!==pw2){ signupError='パスワードが一致しません。'; render(); return; }
-  const id='u_'+Date.now().toString(36);
-  const empNo=genEmpNo();
-  DB.users.push({id,name,empNo,ruleKey:id,password:pw,role:'admin',is_active:true,owner:true});
-  DB.settings.org_name=signupDraft.org;
-  save();
-  signupError=''; authScreen='login';
-  currentUserId=id; sessionStorage.setItem('shiftapp_uid',id);
-  activeTab='dash';
+// ログイン状態が変わったとき（ログイン・ログアウト・ページを開いたときに前回のログインが残っていた場合）
+auth.onAuthStateChanged(user=>{
+  cloud.authKnown=true;
+  const uid=userIdOfAuth(user);
+  if(!uid){
+    stopCloudSync();
+    currentUserId=null; editingCell=null; calPeriodKey='target'; myShiftPeriodKey=null;
+    DB=seed(); // ログアウトしたら画面にデータを残さない
+    render(); return;
+  }
+  currentUserId=uid;
+  if(!cloud.setupInProgress) startCloudSync(); // 最初の1回のデータ移行中は、移し終えてから受信を始める
   render();
-  alert(`登録が完了しました。あなたの社員番号は「${empNo}」です。次回からはこの番号とパスワードでログインしてください。`);
-}
-
-function viewSignupOrg(){
-  return `
-  <div class="card" style="max-width:420px;margin:40px auto">
-    <h2><span class="tag">新規登録 1/2</span> 店舗・企業情報</h2>
-    <p class="desc">はじめに、シフトを管理する店舗または企業の名称を登録します。</p>
-    ${signupError?`<div class="banner warn">${signupError}</div>`:''}
-    <div class="row"><label style="width:100%">店舗または企業名<br>
-      <input id="suOrg" type="text" style="width:100%" placeholder="例）カフェ Shiftly 渋谷店"
-        value="${signupDraft.org.replace(/"/g,'&quot;')}"
-        onkeydown="if(event.key==='Enter')signupOrgNext()"></label></div>
-    <div class="row"><button style="width:100%" onclick="signupOrgNext()">次へ（管理者登録）→</button></div>
-    <div class="row" style="margin:0"><button class="ghost mini" onclick="go2Auth('login')">← ログイン画面に戻る</button></div>
-  </div>`;
-}
-function viewSignupAdmin(){
-  return `
-  <div class="card" style="max-width:420px;margin:40px auto">
-    <h2><span class="tag">新規登録 2/2</span> 管理者アカウント登録</h2>
-    <p class="desc">「${signupDraft.org.replace(/</g,'&lt;')}」の管理者アカウントを作成します。</p>
-    ${signupError?`<div class="banner warn">${signupError}</div>`:''}
-    <div class="row"><label style="width:100%">氏名<br>
-      <input id="suName" type="text" style="width:100%" placeholder="管理者 花子"></label></div>
-    <p class="note">社員番号は登録完了時に5桁の番号が自動で発行されます。</p>
-    <div class="row"><label style="width:100%">パスワード<br>
-      <input id="suPw" type="password" style="width:100%" placeholder="パスワード"></label></div>
-    <div class="row"><label style="width:100%">パスワード（確認）<br>
-      <input id="suPw2" type="password" style="width:100%" placeholder="パスワード（再入力）"
-        onkeydown="if(event.key==='Enter')signupAdminSubmit()"></label></div>
-    <div class="row"><button style="width:100%" onclick="signupAdminSubmit()">登録して開始する</button></div>
-    <div class="row" style="margin:0"><button class="ghost mini" onclick="go2Auth('signupOrg')">← 店舗・企業情報に戻る</button></div>
-  </div>`;
-}
+});
 
 function viewSetPassword(){
-  const u=DB.users.find(x=>x.id===pendingSetupUserId);
-  if(!u){ authScreen='login'; return viewLogin(); }
   return `
   <div class="card" style="max-width:420px;margin:40px auto">
     <h2><span class="tag">初回ログイン</span> パスワード設定</h2>
-    <p class="desc">${u.name}さん、初めてのログインです。今後ログインに使うパスワードを設定してください。</p>
+    <p class="desc">初めてログインする方は、社員番号と、今後ログインに使うパスワード（6文字以上）を設定してください。社員番号は管理者から伝えられた番号です。</p>
     ${pwSetError?`<div class="banner warn">${pwSetError}</div>`:''}
-    <div class="row"><label style="width:100%">新しいパスワード<br>
+    <div class="row"><label style="width:100%">社員番号（5桁）<br>
+      <input id="spEmpNo" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="5" style="width:100%" placeholder="12345"></label></div>
+    <div class="row"><label style="width:100%">新しいパスワード（6文字以上）<br>
       <input id="spPw" type="password" style="width:100%" placeholder="パスワード"></label></div>
     <div class="row"><label style="width:100%">新しいパスワード（確認）<br>
       <input id="spPw2" type="password" style="width:100%" placeholder="パスワード（再入力）"
         onkeydown="if(event.key==='Enter')setInitialPassword()"></label></div>
-    <div class="row"><button style="width:100%" onclick="setInitialPassword()">設定してログイン</button></div>
-    <div class="row" style="margin:0"><button class="ghost mini" onclick="pendingSetupUserId=null; go2Auth('login')">← ログイン画面に戻る</button></div>
+    <div class="row"><button style="width:100%" ${authBusy?'disabled':''} onclick="setInitialPassword()">${authBusy?'処理中…':'設定してログイン'}</button></div>
+    <div class="row" style="margin:0"><button class="ghost mini" onclick="go2Auth('login')">← ログイン画面に戻る</button></div>
   </div>`;
 }
 function viewLogin(){
-  if(authScreen==='signupOrg')   return viewSignupOrg();
-  if(authScreen==='signupAdmin') return viewSignupAdmin();
   if(authScreen==='setPassword') return viewSetPassword();
   return `
   <div class="card" style="max-width:420px;margin:40px auto">
@@ -513,11 +714,12 @@ function viewLogin(){
     <div class="row"><label style="width:100%">パスワード<br>
       <input id="lgPw" type="password" style="width:100%" placeholder="パスワード"
         onkeydown="if(event.key==='Enter')doLogin()"></label></div>
-    <div class="row"><button style="width:100%" onclick="doLogin()">ログイン</button></div>
-    <div class="row" style="margin-bottom:4px"><button class="ghost" style="width:100%" onclick="go2Auth('signupOrg')">新規登録（店舗・企業＋管理者）</button></div>
-    <p class="note">アカウントをお持ちでない場合は「新規登録」から店舗・企業情報と管理者アカウントを作成してください。</p>
+    <div class="row"><button style="width:100%" ${authBusy?'disabled':''} onclick="doLogin()">${authBusy?'処理中…':'ログイン'}</button></div>
+    <div class="row" style="margin-bottom:4px"><button class="ghost" style="width:100%" onclick="go2Auth('setPassword')">初めてログインする（パスワード設定）</button></div>
+    <p class="note">初めて使う方は「初めてログインする」から、管理者に伝えられた社員番号でパスワードを設定してください。</p>
   </div>`;
 }
+
 
 /* ============================================================
    シフト自動作成エンジン
@@ -1054,6 +1256,14 @@ function render(){
   const who=document.getElementById('who');
   const tabsEl=document.getElementById('tabs');
 
+  // ログイン状態の確認中・共有データの読み込み中
+  if(!cloud.authKnown || (currentUserId && !cloud.ready)){
+    who.innerHTML='';
+    tabsEl.innerHTML='';
+    document.getElementById('view').innerHTML=`<div class="card" style="max-width:420px;margin:40px auto;text-align:center">
+      <p class="desc" style="margin:0">読み込み中…</p></div>`;
+    return;
+  }
   // 未ログイン → ログイン画面のみ
   if(!currentUser()){
     who.innerHTML='';
@@ -1137,14 +1347,13 @@ function viewEmps(){
   return `
   <div class="card">
     <h2><span class="tag">4-1</span> 従業員管理機能</h2>
-    <p class="desc">従業員の追加・編集・削除を行います。管理項目：氏名、ログイン情報、役職、権限（PA種別）、在籍状況。社員番号は追加時に自動発行されます。あとから管理者が変更することもできます（数字5桁以内・他の人と重複しない番号）。変更した場合、本人は次回から新しい番号でログインします。パスワードは本人が初回ログイン時に設定します。<br>
+    <p class="desc">従業員の追加・編集・削除を行います。管理項目：氏名、ログイン情報、役職、権限（PA種別）、在籍状況。社員番号は追加時に自動発行されます。あとから管理者が変更することもできます（数字5桁以内・他の人と重複しない番号）。変更した場合、本人は次回から新しい番号でログインします。パスワードは本人がログイン画面の「初めてログインする」から設定します（安全のため、管理者はパスワードを見たり変更したりできません）。<br>
       管理者アカウント（登録者を含む）も削除できます。ただし、ログイン中の自分のアカウントと、ログインできる最後の1人の管理者は削除できません。</p>
     <div class="scroll"><table id="empTable">
-      <tr><th>氏名</th><th>社員番号</th><th>パスワード</th><th>役職</th><th>権限（PA種別）</th><th>在籍</th><th>立ち上げ番</th><th>閉め番</th><th></th></tr>
+      <tr><th>氏名</th><th>社員番号</th><th>役職</th><th>権限（PA種別）</th><th>在籍</th><th>立ち上げ番</th><th>閉め番</th><th></th></tr>
       ${DB.users.map(u=>`<tr>
         <td><input value="${u.name}" onchange="editUser('${u.id}','name',this.value)"></td>
         <td><input value="${u.empNo}" inputmode="numeric" maxlength="5" style="width:6em" onchange="editUser('${u.id}','empNo',this.value)"></td>
-        <td><input value="${u.password||''}" placeholder="${u.mustSetPassword?'（初回ログインで本人が設定）':''}" onchange="editUser('${u.id}','password',this.value)"></td>
         <td>${u.owner
           ? `管理者 <span class="pill muted">登録者</span>`
           : `<select onchange="editUser('${u.id}','role',this.value)">
@@ -1167,7 +1376,7 @@ function viewEmps(){
       <input id="newName" placeholder="氏名">
       <button onclick="addUser()">＋ 従業員を追加</button>
     </div>
-    <p class="note">追加すると5桁の社員番号が自動で発行されます（重複なし）。権限は一旦「一般PA」になります。本人が初回ログイン時に社員番号を入力するとパスワード設定画面が表示されます。発行された社員番号を本人に伝えてください。</p>
+    <p class="note">追加すると5桁の社員番号が自動で発行されます（重複なし）。権限は一旦「一般PA」になります。発行された社員番号を本人に伝え、ログイン画面の「初めてログインする（パスワード設定）」からパスワードを設定してもらってください。</p>
   </div>`;
 }
 // その人を管理者から外す（従業員に変える・在籍を外す・削除する）と、ログインできる管理者が
@@ -1190,8 +1399,7 @@ function editUser(id,f,val){ const u=DB.users.find(x=>x.id===id);
   }
   if(f==='permission' && val==='') val=null;
   u[f]=val;
-  if(f==='password' && val){ u.mustSetPassword=false; } // 管理者が直接パスワードを設定した場合は初回設定フローを解除
-  save(); if(f==='empNo'||f==='role'||f==='name'||f==='is_active'||f==='permission'||f==='password'||f==='closingDuty'||f==='openingDuty') render(); }
+  save(); if(f==='empNo'||f==='role'||f==='name'||f==='is_active'||f==='permission'||f==='closingDuty'||f==='openingDuty') render(); }
 // 従業員・管理者（登録者を含む）のアカウントを削除する。
 // ただし、ログイン中の自分自身と、ログインできる最後の管理者は削除できない（管理画面に誰も入れなくなるのを防ぐ）。
 function delUser(id){ const t=DB.users.find(x=>x.id===id);
@@ -1211,9 +1419,9 @@ function delUser(id){ const t=DB.users.find(x=>x.id===id);
 function addUser(){ const n=document.getElementById('newName').value.trim(); if(!n){alert('氏名を入力してください');return;}
   const empNo=genEmpNo();
   const id='u_'+Date.now();
-  DB.users.push({id,name:n,empNo,ruleKey:id,password:null,mustSetPassword:true,role:'employee',permission:'general',is_active:true,openingDuty:false,closingDuty:false});
+  DB.users.push({id,name:n,empNo,ruleKey:id,role:'employee',permission:'general',is_active:true,openingDuty:false,closingDuty:false});
   save(); render();
-  alert(`「${n}」さんの社員番号は「${empNo}」です。権限は一旦「一般PA」です。\n初回ログイン時に社員番号を入力するとパスワード設定画面が表示されるので、本人に設定してもらってください。`); }
+  alert(`「${n}」さんの社員番号は「${empNo}」です。権限は一旦「一般PA」です。\nログイン画面の「初めてログインする（パスワード設定）」から、本人にパスワードを設定してもらってください。`); }
 
 /* ---------- 管理者: 必要最低人数 ---------- */
 function viewNeed(){
