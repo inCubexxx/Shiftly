@@ -72,20 +72,41 @@ const paLabel = u => u.permission ? (PA_TYPES[u.permission]?PA_TYPES[u.permissio
 const isStaff = u => !!u.permission; // PA種別を持つ人がシフト対象（管理者でもPA種別があれば対象）
 
 /* ---------- 休憩時間ルール ----------
-   ・実働6時間以上：45分／実働8時間以上：1時間
-   ・水上さん（社員番号17833）は平日30分固定・土曜出勤は休憩なし（個人ルールが優先）
-   ・金子さん・小林さん・星山さんは、本来45分になる休憩を50分に延長（個人ルールが優先）
-   ・週の判定と同じく、ここでの「時間」はその日の実働（休憩を除く勤務）時間 */
+   ・お店のルール（シフトの長さ＝出勤〜退勤で決める）：6時間以上は45分、8時間以上は1時間。
+     金子さん・小林さん・星山さんは45分の休憩を50分に延長。
+     水上さん（社員番号17833）は平日30分・土曜出勤は休憩なし。
+   ・ただし、お店のルールの休憩では労働基準法34条を満たさない日だけ、法律の基準の休憩にする。
+     法律：労働時間（休憩を除いた実働）が6時間を超えるなら45分以上、8時間を超えるなら1時間以上。
+     （今のルールで当てはまるのは水上さんの長いシフトだけ。例：平日7時間なら、30分では実働6時間30分に
+      なって足りないので45分。土曜9時間なら、休憩なしでは実働9時間になるので1時間）
+   ・法律では、休憩は「労働時間の途中に」与える必要があるので、シフトの最初や最後にくっつけない（⑥）。
+   ・9:30〜10:00（開店直後）は誰も休憩に入らない（自動作成のとき。generateShifts の capWindows の noBreak） */
 const MIZUKAMI_RULE_KEY = '17833';
 const EXTENDED_45MIN_BREAK_RULE_KEYS = new Set(['17649','44165','75643']); // 金子・小林・星山: 45分→50分
-function breakMinutesFor(u, dateIso, workMin){
-  if(!workMin || workMin<=0) return 0;
-  if(u && ruleKeyOf(u)===MIZUKAMI_RULE_KEY){
-    return dowOf(dateIso)===6 ? 0 : 30; // 土曜出勤は休憩なし、それ以外は30分固定
-  }
-  if(workMin>=8*60) return 60;
-  if(workMin>=6*60) return (u && EXTENDED_45MIN_BREAK_RULE_KEYS.has(ruleKeyOf(u))) ? 50 : 45;
-  return 0;
+// シフトの長さ shiftMin（分）の中に休憩 breakMin（分）を入れたとき、労働基準法34条を満たすか
+function isLawfulBreak(shiftMin, breakMin){
+  const workMin=shiftMin-breakMin; // 実働（休憩を除いた時間）
+  if(workMin<=6*60) return true;         // 実働6時間以下：休憩の決まりはない
+  if(workMin<=8*60) return breakMin>=45; // 実働6時間を超え8時間以下：45分以上
+  return breakMin>=60;                   // 実働8時間を超える：1時間以上
+}
+// 法律の基準の休憩（なし・45分・1時間のうち、法律を満たすいちばん短いもの）
+function legalBreakMinutes(shiftMin){
+  if(isLawfulBreak(shiftMin,0)) return 0;
+  if(isLawfulBreak(shiftMin,45)) return 45;
+  return 60;
+}
+// この人がその日、長さ shiftMin（出勤〜退勤・分）のシフトに入るときの休憩の長さ（分）
+function breakMinutesFor(u, dateIso, shiftMin){
+  if(!shiftMin || shiftMin<=0) return 0;
+  // お店のルール
+  let brk;
+  if(u && ruleKeyOf(u)===MIZUKAMI_RULE_KEY) brk = dowOf(dateIso)===6 ? 0 : 30; // 土曜出勤は休憩なし、平日は30分
+  else if(shiftMin>=8*60) brk=60;
+  else if(shiftMin>=6*60) brk=(u && EXTENDED_45MIN_BREAK_RULE_KEYS.has(ruleKeyOf(u))) ? 50 : 45;
+  else brk=0;
+  // お店のルールで法律を満たすならそのまま、満たさない日だけ法律の基準にする
+  return isLawfulBreak(shiftMin, brk) ? brk : legalBreakMinutes(shiftMin);
 }
 
 /* ---------- 個人ごとの優先勤務時間（自動作成時の「優先ヒント」） ----------
@@ -757,8 +778,9 @@ function generateShifts(){
   // ラベル（立ち上げ番・閉め番）が同時に複数人につく日は、削られる人が公平ローテーションの
   // 巡り合わせで毎回変わってしまうと不公平感が出るため、priorityRuleKeysで固定の優先順位を
   // つける（リストに無い人はラベルが付いていても優先順位は一番低い扱いになる）。
+  // noBreak: この時間帯は誰も休憩に入らない（開店直後は休憩なし。⑥で休憩の候補から外す）。
   const capWindows=[
-    {start:'09:30', end:'10:00', max:1, edge:'start', preferLabel:'openingDuty',
+    {start:'09:30', end:'10:00', max:1, edge:'start', preferLabel:'openingDuty', noBreak:true,
       priorityRuleKeys:['17649','44165','75643']}, // 金子＞小林＞星山
     {start:'20:00', end:'20:30', max:2, edge:'end', preferLabel:'closingDuty',
       priorityRuleKeys:['19111','9643','51180']}, // 長井＞鈴木＞寺嶋
@@ -767,6 +789,8 @@ function generateShifts(){
     const idx=(cw.priorityRuleKeys||[]).indexOf(ruleKeyOf(u));
     return idx===-1 ? 999 : idx;
   };
+  // 休憩 [s,e) が、休憩禁止（noBreak）の時間帯に少しでも重なるか
+  const overlapsNoBreakWindow=(s,e)=>capWindows.some(cw=>cw.noBreak && s<toMin(cw.end) && e>toMin(cw.start));
 
   const shortages=[];
 
@@ -961,13 +985,17 @@ function generateShifts(){
     // 新しく人を追加する時（穴埋め・休憩バックフィル）、その人の勤務時間が9:30〜10:00や20:00〜20:30を
     // まるごと覆ってしまうと、⑤で調整したはずの上限人数を再び超えてしまう。追加する側の端を削って
     // 上限を超えないようにする（すでにこの時間帯が上限に達している場合だけ）。
-    // 休憩の穴埋めで呼ぶ場合は、休憩に入る本人（excludeUserId）はその間その場にいないので、
-    // 上限人数のカウントから外す（本人の休憩中に代わりに1人入るだけなら、上限を超えたことにはならない）。
-    const clipForCapWindows=(hs,he,excludeUserId)=>{
+    // notCounted（{userId, from, to}）は、上限人数を数えるときに外す人。その人が from〜to の間その場にいない場合に使う。
+    //   ・休憩の穴埋め：休憩に入る本人。休憩がその時間帯をまるごと覆うときだけ外す（休憩中に代わりに1人入るだけなら
+    //     上限を超えたことにはならない）。休憩が別の時間なら、本人はその時間帯にいるので数える
+    //     （以前は休憩の時間に関係なく外していたため、午後の休憩の代わりの人が朝から入り、上限を超えることがあった）。
+    //   ・勤務を伸ばすとき：伸ばしている本人（今のシフトは伸ばした後のシフトに置き換わるので、一日中外す）。
+    const clipForCapWindows=(hs,he,notCounted)=>{
       for(const cw of capWindows){
         const ws=toMin(cw.start), we=toMin(cw.end);
         if(hs<=ws && he>=we){
-          const covering=dayShifts.filter(sh=>sh.user_id!==excludeUserId && toMin(sh.start)<=ws && toMin(sh.end)>=we).length;
+          const skipId=(notCounted && notCounted.from<=ws && notCounted.to>=we) ? notCounted.userId : null;
+          const covering=dayShifts.filter(sh=>sh.user_id!==skipId && toMin(sh.start)<=ws && toMin(sh.end)>=we).length;
           if(covering>=cw.max){
             if(cw.edge==='start') hs=Math.max(hs,we); else he=Math.min(he,ws);
           }
@@ -983,6 +1011,8 @@ function generateShifts(){
     // 30分広げた枠→不足区間ぴったりの順で対象者全員を試す（1人目が narrow な結果になっても、
     // 別の人なら希望時間そのまま入れられる、という場合を取りこぼさないようにする）。
     const findBackfillHelper=(start,end,excludeIds,coveringForUserId)=>{
+      // 休憩の穴埋めのときは、休憩に入る本人（coveringForUserId）は start〜end の間その場にいない
+      const away = coveringForUserId ? {userId:coveringForUserId, from:start, to:end} : undefined;
       const eligible=DB.users.filter(cu=>{
         if(!isStaff(cu) || !cu.is_active || excludeIds.has(cu.id)) return false;
         const p=(DB.employee_preferences[cu.id]||{})[date];
@@ -1007,7 +1037,7 @@ function generateShifts(){
       };
       const tryRange=(cu,hs,he)=>{
         if(!fitsCaps(cu,hs,he)) return null;
-        [hs,he]=clipForCapWindows(hs,he,coveringForUserId);
+        [hs,he]=clipForCapWindows(hs,he,away);
         if(he-hs<MIN_SHIFT_MIN || hs>start || he<end) return null;
         return [hs,he];
       };
@@ -1048,7 +1078,10 @@ function generateShifts(){
         const pa=PA_TYPES[u.permission];
         if(pa && pa.weekCapMin!=null && (weekMin[u.id][wk]||0)+(ne-ns)>=pa.weekCapMin) continue;
         if(u.permission==='dependent_student' && (ne-ns)>=DEPENDENT_STUDENT_DAY_CAP_MIN) continue;
-        [ns,ne]=clipForCapWindows(ns,ne);
+        // 上限人数を数えるときは、伸ばしている本人を数えない（今のシフトは伸ばした後のシフトに置き換わるため）。
+        // 以前は本人も数えていたので、9:30から入っている本人を「上限の1人」とみなして自分の出勤を10:00に
+        // 遅らせてしまい、開店直後に誰もいないのに人員不足としても記録されない不具合があった。
+        [ns,ne]=clipForCapWindows(ns,ne,{userId:sh.user_id, from:0, to:24*60});
         if(ns>gapStart || ne<gapEnd) continue; // 上限人数の都合で結局不足区間を覆えないなら諦める
         if(ne-ns<MIN_SHIFT_MIN) continue;
         sh.start=toHM(ns); sh.end=toHM(ne);
@@ -1058,8 +1091,7 @@ function generateShifts(){
     };
 
     // ---- ⑤の後の穴埋め: ③④⑤で人を減らした結果できた「素の人員不足」を、可能なら別の人で埋める ----
-    // （ここで埋められない分は、休憩を考慮する前からすでに不足しているとして正直に記録する。
-    //   以前は休憩に絡まない不足がカレンダーの「不足」欄に出てこない見落としがあったための対策）
+    // （ここで埋められない分は、この日の最後に、でき上がったシフトと休憩からまとめて数えて記録する）
     {
       const workingAt2=m=>dayShifts.filter(sh=>toMin(sh.start)<=m && toMin(sh.end)>m).length;
       const excludeIds=new Set(dayShifts.map(x=>x.user_id));
@@ -1080,8 +1112,7 @@ function generateShifts(){
         if(tryExtendExisting(gapStart,gapEnd)){
           continue; // 埋まったので同じiから再判定する
         }
-        shortages.push({date,start:toHM(gapStart),end:toHM(gapEnd),required:need,assigned:working});
-        i=j;
+        i=j; // 埋められなかった（不足としての記録は、この日の最後にまとめて行う）
       }
     }
 
@@ -1097,25 +1128,27 @@ function generateShifts(){
     for(let qi=0; qi<breakQueue.length; qi++){
       const sh=breakQueue[qi];
       const u=DB.users.find(x=>x.id===sh.user_id);
-      const workMin=toMin(sh.end)-toMin(sh.start);
-      const brk=u?breakMinutesFor(u,date,workMin):0;
+      const shiftMin=toMin(sh.end)-toMin(sh.start); // シフトの長さ（出勤〜退勤）。実働はここから休憩を引いた残り
+      const brk=u?breakMinutesFor(u,date,shiftMin):0;
       if(brk<=0) continue;
       const bs=toMin(sh.start), be=toMin(sh.end), mid=(bs+be)/2;
-      // 休憩が退勤時刻ちょうどに終わる候補（t+brk===be）も許容する（<=）。以前は<だったため
-      // その1候補だけ取りこぼしていた。
-      const starts=[]; for(let t=bs;t+brk<=be;t+=SLOT_MIN) starts.push(t);
+      // 休憩は労働時間の途中に与える（労働基準法34条）。出勤してすぐ（t===bs）や、退勤時刻ちょうどに終わる
+      // 休憩（t+brk===be）は、実際には休憩なしで働き続けて帰るのと同じなので候補にしない。
+      // （以前は退勤時刻ちょうどに終わる候補も許容していたが、法律上の休憩にならないため外した）
+      // 休憩禁止の時間帯（9:30〜10:00）に少しでも重なる候補も外す。
+      const starts=[]; for(let t=bs+SLOT_MIN;t+brk<be;t+=SLOT_MIN){ if(!overlapsNoBreakWindow(t,t+brk)) starts.push(t); }
       starts.sort((a,b)=>Math.abs((a+brk/2)-mid)-Math.abs((b+brk/2)-mid));
-      let placed=false, best=null, bestShort=Infinity, bestReq=0, bestWorking=0;
+      let placed=false, best=null, bestShort=Infinity;
       for(const start of starts){
         const end=start+brk;
-        let ok=true, worst=0, worstReq=0, worstWorking=0;
+        let ok=true, worst=0; // worst: この休憩の間で、いちばん多く足りなくなる人数
         for(let t=start;t<end;t+=SLOT_MIN){
           const working=workingAt(t)-onBreakAt(t)-1;
           const need=req[t]||0;
-          if(working<need){ ok=false; const short=need-working; if(short>worst){ worst=short; worstReq=need; worstWorking=working; } }
+          if(working<need){ ok=false; worst=Math.max(worst, need-working); }
         }
         if(ok){ breaksToday.push({user_id:sh.user_id,date,start:toHM(start),end:toHM(end)}); placed=true; break; }
-        if(worst<bestShort){ bestShort=worst; best={start,end}; bestReq=worstReq; bestWorking=worstWorking; }
+        if(worst<bestShort){ bestShort=worst; best={start,end}; }
       }
       if(!placed){
         for(const start of starts){
@@ -1137,10 +1170,17 @@ function generateShifts(){
         }
       }
       if(!placed && best){
+        // 誰も代わりに入れないときは、休憩（法律上必要）を優先して、足りなくなる人数がいちばん少ない時間に入れる
+        // （この不足も、この日の最後にまとめて数えて記録する）
         breaksToday.push({user_id:sh.user_id,date,start:toHM(best.start),end:toHM(best.end)});
-        shortages.push({date,start:toHM(best.start),end:toHM(best.end),required:bestReq,assigned:bestWorking});
       }
     }
+
+    // ---- この日の人員不足を記録する ----
+    // 途中の段階ごとに記録すると、後の段階（休憩の代わりの人の追加など）で埋まった不足が残ったり、
+    // 実際に足りない時間より広く記録されたりする。でき上がったシフトと休憩から数え直すことで、
+    // 記録される不足は必ず実際の状態と一致する（カレンダーで手直ししたときと同じ数え方）。
+    shortages.push(...shortagesOfDay(date, dayShifts, breaksToday));
 
     // ---- この日の結果を確定し、週の実働時間・連続勤務日数を更新してから次の日へ ----
     DB.shifts.push(...dayShifts);
@@ -1202,25 +1242,32 @@ function suppressClosingDutyShortages(list){
   }
   return out;
 }
-// カレンダーでのシフト手動編集（追加・更新・削除）のあと、その日だけ必要最低人数の充足状況を
-// 作成し直す。他の日の不足はそのまま、全体の再作成をしなくてもその日の分だけ最新化される。
-function recomputeShortagesForDate(date){
+// その日のシフトと休憩から、必要最低人数に足りない時間帯を数える。
+// 15分ごとに「シフトに入っている人数 − 休憩中の人数」と必要最低人数を比べ、同じ状態が続く所は1件にまとめる。
+// 自動作成（generateShifts）の各日の最後と、カレンダーでの手直しのあと（recomputeShortagesForDate）の
+// 両方でこの関数を使うので、どちらで作っても不足の数え方は必ず同じになる。
+function shortagesOfDay(date, dayShifts, dayBreaks){
   const req=slotRequired(date);
-  const dayShifts=DB.shifts.filter(x=>x.date===date);
-  const dayBreaks=(DB.breaks||[]).filter(x=>x.date===date);
   const workingAt=m=>dayShifts.filter(sh=>toMin(sh.start)<=m && toMin(sh.end)>m).length
                      - dayBreaks.filter(b=>toMin(b.start)<=m && toMin(b.end)>m).length;
-  const newForDate=[];
+  const out=[];
   const times=Object.keys(req).map(Number).sort((a,b)=>a-b);
   let i=0;
   while(i<times.length){
     const t=times[i], working=workingAt(t), need=req[t];
     if(working>=need){ i++; continue; }
-    let j=i;
-    while(j<times.length && workingAt(times[j])===working && req[times[j]]===need) j++;
-    newForDate.push({date, start:toHM(t), end:toHM(times[j-1]+SLOT_MIN), required:need, assigned:working});
+    let j=i+1;
+    // 時間がつながっていて（必要最低人数の設定がない時間をはさまない）、人数も同じ間は1件にまとめる
+    while(j<times.length && times[j]===times[j-1]+SLOT_MIN && workingAt(times[j])===working && req[times[j]]===need) j++;
+    out.push({date, start:toHM(t), end:toHM(times[j-1]+SLOT_MIN), required:need, assigned:working});
     i=j;
   }
+  return out;
+}
+// カレンダーでのシフト手動編集（追加・更新・削除）のあと、その日だけ必要最低人数の充足状況を
+// 作成し直す。他の日の不足はそのまま、全体の再作成をしなくてもその日の分だけ最新化される。
+function recomputeShortagesForDate(date){
+  const newForDate=shortagesOfDay(date, DB.shifts.filter(x=>x.date===date), (DB.breaks||[]).filter(x=>x.date===date));
   const others=(DB.settings.shortages||[]).filter(s=>s.date!==date);
   DB.settings.shortages = mergeShortages(suppressClosingDutyShortages([...others, ...newForDate]));
 }
@@ -1299,7 +1346,9 @@ function viewDash(){
   const emps=DB.users.filter(u=>isStaff(u)&&u.is_active);
   const days=rangeDates(s.period_start,s.period_end);
   const submitted=emps.filter(u=>DB.submissions[u.id]===s.period_start);
-  const shortMin=shortagesInTarget().reduce((a,x)=>a+(x.required-x.assigned),0);
+  // 人員不足の合計（人時）＝「足りない人数 × その時間の長さ」をすべて足したもの（例：2人足りない状態が30分なら1人時）
+  const shortPersonMin=shortagesInTarget().reduce((a,x)=>a+(x.required-x.assigned)*(toMin(x.end)-toMin(x.start)),0);
+  const shortPersonHours=Math.round(shortPersonMin/6)/10; // 時間に直して小数第1位まで
   const afterDeadline = iso(new Date())>s.deadline;
   const latestPub=latestPublishedPeriod();
   return `
@@ -1310,7 +1359,7 @@ function viewDash(){
       <div class="box"><span class="note">対象期間</span><b>${fmtDate(s.period_start)}〜${fmtDate(s.period_end)}</b></div>
       <div class="box"><span class="note">希望提出締切</span><b>${fmtDate(s.deadline)} ${afterDeadline?'<span class="pill bad">締切後</span>':'<span class="pill ok">受付中</span>'}</b></div>
       <div class="box"><span class="note">希望提出状況</span><b>${submitted.length} / ${emps.length} 名</b></div>
-      <div class="box"><span class="note">人員不足</span><b>${shortMin>0?`<span style="color:var(--bad)">${shortMin} 人時</span>`:'<span style="color:var(--ok)">なし</span>'}</b></div>
+      <div class="box"><span class="note">人員不足</span><b>${shortPersonMin>0?`<span style="color:var(--bad)">${shortPersonHours} 人時</span>`:'<span style="color:var(--ok)">なし</span>'}</b></div>
       <div class="box"><span class="note">公開済みの最新シフト</span><b>${latestPub?`${fmtDate(latestPub.start)}〜${fmtDate(latestPub.end)}`:'<span class="pill muted">まだありません</span>'}</b></div>
     </div>
   </div>
@@ -1495,7 +1544,7 @@ function viewMake(){
       3. 扶養PA（週20時間未満）・扶養学生PA（週40時間未満・1日8時間未満）の上限を守る<br>
       4. 3連勤を超えないように調整する（人員不足が出る場合のみ4連勤まで許容）<br>
       5. 9:30〜10:00は1人、20:00〜20:30は2人を超えないように調整する（「立ち上げ番」「閉め番」ラベルの人を優先。複数人つく場合は金子＞小林＞星山、長井＞鈴木＞寺嶋の順）<br>
-      6. 必要最低人数を割らないように休憩を入れる（休憩で不足が出る場合は、他の人に代わりに出勤してもらう）
+      6. 必要最低人数を割らないように休憩を入れる（休憩は勤務の途中に入れ、9:30〜10:00は誰も休憩に入らない。休憩で不足が出る場合は、他の人に代わりに出勤してもらう）
     </p>
     <div class="row">
       <button onclick="doGenerate()">⚙️ シフトを自動作成する</button>
@@ -1939,8 +1988,10 @@ function viewMyShift(){
     let cellTxt = list.length?list.map(x=>x.start+'〜'+x.end).join(' , '):(p&&p.day_off?'休み':'—');
     return `<tr><td>${fmtDate(d)}</td><td class="${list.length?'work':(p&&p.day_off?'off':'')}">${cellTxt}</td><td>${brk?brk.start+'〜'+brk.end:(list.length?'なし':'—')}</td></tr>`;
   }).join('');
-  const totalH=DB.shifts.filter(x=>x.user_id===u.id&&x.date>=period.start&&x.date<=period.end)
-    .reduce((a,x)=>a+(toMin(x.end)-toMin(x.start)),0)/60;
+  const totalShiftMin=DB.shifts.filter(x=>x.user_id===u.id&&x.date>=period.start&&x.date<=period.end)
+    .reduce((a,x)=>a+(toMin(x.end)-toMin(x.start)),0);
+  const totalWorkMin=totalShiftMin-totalBreakMin; // 実働＝シフトの長さの合計から休憩の合計を引いたもの
+  const totalWorkText=`${Math.floor(totalWorkMin/60)}時間${totalWorkMin%60 ? (totalWorkMin%60)+'分' : ''}`;
   return `<div class="card">
     <h2><span class="tag">3-3</span> 自分の勤務シフト（${u.name}）</h2>
     <div class="row">
@@ -1951,7 +2002,7 @@ function viewMyShift(){
       </label>
     </div>
     ${newer.length?`<div class="banner ok">📢 ${newer.map(pp=>`${fmtDate(pp.start)}〜${fmtDate(pp.end)}`).join('、')} のシフトも公開されています。上のプルダウンで切り替えられます。</div>`:''}
-    <div class="banner ok">✅ 公開済み（${period.published_at||'日時不明'}）／ 合計（実働） ${totalH} 時間／ 休憩合計 ${totalBreakMin} 分</div>
+    <div class="banner ok">✅ 公開済み（${period.published_at||'日時不明'}）／ 合計（実働） ${totalWorkText}／ 休憩合計 ${totalBreakMin} 分</div>
     <div class="scroll"><table><tr><th>日付</th><th>勤務時間</th><th>休憩</th></tr>${rows}</table></div>
   </div>`;
 }
