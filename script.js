@@ -1466,7 +1466,7 @@ function calendarHTML(editable){
       </label>
     </div>
     <p class="desc">${fmtDate(period.start)}〜${fmtDate(period.end)}　${periodPublished?'<span class="pill ok">公開中</span>':'<span class="pill muted">非公開</span>'}${editable?'　<span class="note">※ マスの上をクリックすると、その人・その日のシフトを編集できます。</span>':''}${editable&&periodPublished?'<br><span class="note">※ 公開済みの期間を編集すると、その内容はすぐに従業員にも見えます。</span>':''}</p>
-    <div class="scroll"><table>
+    <div class="scroll"><table class="cal">
       <tr><th>従業員</th>${days.map(d=>`<th>${fmtDate(d)}</th>`).join('')}</tr>
       ${emps.map(u=>`<tr><th>${u.name}</th>${days.map(d=>cell(u,d)).join('')}</tr>`).join('')}
       <tr><th>必要最低人数充足</th>${days.map(d=>{

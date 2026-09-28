@@ -57,5 +57,43 @@
   .kpi{display:flex;gap:14px;flex-wrap:wrap}
   .kpi .box{flex:1;min-width:150px;background:var(--soft);border-radius:12px;padding:12px 14px}
   .kpi .box b{font-size:22px;display:block}
-  fieldset{border:1px solid var(--line);border-radius:10px;margin:0 0 12px;padding:10px 12px}
+  /* min-width:0 … fieldset は既定で「中身の最小幅」より狭くならないため、中の広い表に引っ張られて画面からはみ出すのを防ぐ */
+  fieldset{border:1px solid var(--line);border-radius:10px;margin:0 0 12px;padding:10px 12px;min-width:0}
   legend{font-weight:700;padding:0 6px;color:var(--brand)}
+
+  /* ---------- スマホ用（画面幅 640px 以下のときだけ適用） ---------- */
+  @media (max-width:640px){
+    .wrap{padding:12px}
+    header.top{padding:10px 12px;gap:6px}
+    header.top h1 img{height:40px}
+    header.top .who{margin-left:0;width:100%;justify-content:flex-end;flex-wrap:wrap;font-size:12px}
+
+    /* タブは折り返さず、横にスワイプして切り替える */
+    nav.tabs{flex-wrap:nowrap;overflow-x:auto;margin:0 -12px 12px;padding:0 12px 6px}
+    nav.tabs button{flex:0 0 auto;white-space:nowrap}
+
+    .card{padding:14px 12px;border-radius:12px;margin-bottom:12px}
+    fieldset{padding:8px 10px}
+    .kpi{gap:8px}
+    .kpi .box{padding:10px 12px}
+    .kpi .box b{font-size:18px}
+
+    /* iPhone は文字が 16px 未満の入力欄をタップすると画面を自動で拡大してしまうので 16px にする */
+    select,input{font-size:16px}
+    button{padding:9px 14px}
+    button.mini{padding:5px 10px}
+
+    /* 表のセルは1文字ずつ折り返さず、はみ出た分は .scroll の横スクロールで見る */
+    th,td{white-space:nowrap;padding:6px}
+    .scroll{-webkit-overflow-scrolling:touch}
+
+    /* 「開始 [時刻]」のようなラベルと入力欄が別々の行に分かれないようにする */
+    label{white-space:nowrap;max-width:100%}
+    label select{display:block;margin-top:4px;max-width:100%} /* 長いプルダウンはラベルの下に置いて画面幅に収める */
+    .row{gap:8px}
+    .row > b{width:100% !important} /* 一括設定の「平日」「土日」見出しを1行使って表示 */
+    .row > b:empty{display:none}    /* 位置合わせ用の空の見出しはスマホでは不要 */
+
+    /* カレンダーは従業員名の列を固定して、日付だけ横にスクロールさせる */
+    table.cal tr > th:first-child{position:sticky;left:0;z-index:1;box-shadow:1px 0 0 var(--line)}
+  }
