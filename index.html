@@ -5,16 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Shiftly 面倒なシフト作成を、ワンクリックで。</title>
 <link rel="icon" type="image/png" href="icon.png">
-<link rel="stylesheet" href="style.css?v=20260928a">
+<link rel="stylesheet" href="style.css?v=20260929a">
 </head>
 <body>
 <header class="top">
+  <!-- 画面を切り替えるメニュー（ロゴの左の三本線ボタンと、押すと開く一覧）。中身は script.js の render() が作る -->
+  <div class="menu" id="menu"></div>
   <h1><img src="title.png" alt="Shiftly - 面倒なシフト作成を、ワンクリックで。"></h1>
   <div class="who" id="who"></div>
 </header>
 
 <div class="wrap">
-  <nav class="tabs" id="tabs"></nav>
   <div id="view"></div>
 </div>
 
@@ -22,6 +23,6 @@
 <script src="https://www.gstatic.com/firebasejs/12.19.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/12.19.0/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore-compat.js"></script>
-<script src="script.js?v=20260928g"></script>
+<script src="script.js?v=20260929d"></script>
 </body>
 </html>

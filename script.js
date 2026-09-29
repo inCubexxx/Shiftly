@@ -1,6 +1,6 @@
 /* ============================================================
-   データ層 (Firebase / Firestore でみんなと共有)
-   ・店舗全体のデータ（従業員一覧・必要人数・設定・シフト・休憩）… app/main（管理者だけが書き込める）
+   データ層 (Firebase / Firestore)
+   ・店舗全体のデータ（従業員一覧・必要人数・設定・シフト・休憩）… app/main（管理者が変更可）
    ・従業員ごとの勤務希望 ……………………………………………… prefs/{ユーザーID}（本人と管理者だけ）
    ・社員番号 → 内部ID（ログイン画面で使う）…………………………… logins/{社員番号}（番号を知っている1件だけ誰でも読める。一覧は取れない）
    ・初期設定が済んでいるかの印 …………………………………………… app/public（誰でも読める）
@@ -36,8 +36,10 @@ const cloud={
   mainJson:null,       // 最後にクラウドと一致していた内容（変わった部分だけ送るための比較用）
   prefsJson:{},        // userId -> 同上
   logins:{},           // 社員番号 -> 内部ID（同上）
-  mainUnsub:null, prefsUnsub:null, // リアルタイム受信を止める関数
+  mainUnsub:null, prefsUnsub:null, lastLoginUnsub:null, // リアルタイム受信を止める関数
   prefsAsAdmin:null,   // 勤務希望を「全員分（管理者）」「自分の分」のどちらで受信しているか
+  lastLogins:{},       // userId -> 最終ログイン日 'YYYY-MM-DD'（管理者だけ受信する。DB には入れないので save() では送らない）
+  lastLoginError:false, // 最終ログイン日を読み込めなかったか（セキュリティルールが古いままのときなど）
   setupInProgress:false, // 最初の1回のデータ移行中
 };
 
@@ -66,14 +68,16 @@ const MAX_CONSECUTIVE_WORK_DAYS_OVERRIDE_BY_RULE_KEY = {
 };
 const maxConsecutiveFor = u => (u && MAX_CONSECUTIVE_WORK_DAYS_OVERRIDE_BY_RULE_KEY[ruleKeyOf(u)]) || MAX_CONSECUTIVE_WORK_DAYS;
 const MIN_SHIFT_MIN = 3*60; // 1日の拘束時間（出勤〜退勤、1本の連続勤務）はこれ以上でなければならない（3時間未満は不可。3時間ちょうどはOK）
+// 希望提出締切の既定値：対象期間の初日の8日前。締切日の当日までは入力できるので、
+// 締切後になるのは翌日＝初日のちょうど1週間前から（deadlineDateOf / isAfterDeadline 参照）
+const DEFAULT_DEADLINE_DAYS_BEFORE = 8;
 const DOW=['日','月','火','水','木','金','土'];
 const roleLabel = r => r==='admin' ? '管理者' : '従業員';
 const paLabel = u => u.permission ? (PA_TYPES[u.permission]?PA_TYPES[u.permission].label:'') : '';
 const isStaff = u => !!u.permission; // PA種別を持つ人がシフト対象（管理者でもPA種別があれば対象）
 
 /* ---------- 休憩時間ルール ----------
-   ・お店のルール（シフトの長さ＝出勤〜退勤で決める）：6時間以上は45分、8時間以上は1時間。
-     金子さん・小林さん・星山さんは45分の休憩を50分に延長。
+    （本人規模）金子さん・小林さん・星山さんは45分の休憩を50分に延長。
      水上さん（社員番号17833）は平日30分・土曜出勤は休憩なし。
    ・ただし、お店のルールの休憩では労働基準法34条を満たさない日だけ、法律の基準の休憩にする。
      法律：労働時間（休憩を除いた実働）が6時間を超えるなら45分以上、8時間を超えるなら1時間以上。
@@ -85,7 +89,7 @@ const MIZUKAMI_RULE_KEY = '17833';
 const EXTENDED_45MIN_BREAK_RULE_KEYS = new Set(['17649','44165','75643']); // 金子・小林・星山: 45分→50分
 // シフトの長さ shiftMin（分）の中に休憩 breakMin（分）を入れたとき、労働基準法34条を満たすか
 function isLawfulBreak(shiftMin, breakMin){
-  const workMin=shiftMin-breakMin; // 実働（休憩を除いた時間）
+  const workMin=shiftMin-breakMin;       // 実働（休憩を除いた時間）
   if(workMin<=6*60) return true;         // 実働6時間以下：休憩の決まりはない
   if(workMin<=8*60) return breakMin>=45; // 実働6時間を超え8時間以下：45分以上
   return breakMin>=60;                   // 実働8時間を超える：1時間以上
@@ -152,8 +156,10 @@ function seed(){
     settings:{
       period_start: isoAddDays(mondayOf(new Date()),7),
       period_end: isoAddDays(mondayOf(new Date()),13),
-      deadline: iso(new Date()),
-      // 公開済みの期間の一覧。{start,end,deadline,published_at,last_generated}
+      // 希望提出締切は日付ではなく「対象期間の初日の何日前か」で持つ（締切日そのものは deadlineDateOf で計算する）。
+      // こうしておくと、公開して対象期間が次へ進んだときや開始日を変えたときも、締切日が自動でついてくる。
+      deadline_days_before: DEFAULT_DEADLINE_DAYS_BEFORE,
+      // 公開済みの期間の一覧。{start,end,published_at,last_generated}
       // 公開すると対象期間（period_start〜period_end）は次の期間へ進むので、公開済みかどうかは
       // 「今の対象期間」ではなく、この一覧で判定する（公開したシフトを後からも見られるようにするため）。
       published_periods:[],
@@ -390,13 +396,14 @@ function cloudWrite(promise){
 // ログインしたら、共有データのリアルタイム受信を始める（他の人が変更すると自動で届く）
 function startCloudSync(){
   stopCloudSync();
-  Object.assign(cloud,{ready:false, mainLoaded:false, prefsLoaded:false, mainJson:null, prefsJson:{}, logins:{}, prefsAsAdmin:null});
+  Object.assign(cloud,{ready:false, mainLoaded:false, prefsLoaded:false, mainJson:null, prefsJson:{}, logins:{}, prefsAsAdmin:null, lastLogins:{}, lastLoginError:false});
   DB=seed(); // 読み込み終わるまでは空のデータ（前にログインしていた人のデータを残さない）
   cloud.mainUnsub=fs.doc('app/main').onSnapshot(onMainSnapshot, cloudReadError);
 }
 function stopCloudSync(){
   if(cloud.mainUnsub){ cloud.mainUnsub(); cloud.mainUnsub=null; }
   if(cloud.prefsUnsub){ cloud.prefsUnsub(); cloud.prefsUnsub=null; }
+  if(cloud.lastLoginUnsub){ cloud.lastLoginUnsub(); cloud.lastLoginUnsub=null; }
   cloud.ready=false;
 }
 function onMainSnapshot(snap){
@@ -416,7 +423,7 @@ function onMainSnapshot(snap){
   if(!me || !me.is_active){ cloudReadError({code:'permission-denied'}); return; }
   cloud.mainLoaded=true;
   const asAdmin = me.role==='admin';
-  if(cloud.prefsAsAdmin!==asAdmin){ subscribePrefs(asAdmin); return; } // 勤務希望を読み込み終えてから描画する
+  if(cloud.prefsAsAdmin!==asAdmin){ subscribeLastLogins(asAdmin); subscribePrefs(asAdmin); return; } // 勤務希望を読み込み終えてから描画する
   if(changed) refreshAfterCloud();
 }
 function subscribePrefs(asAdmin){
@@ -449,8 +456,36 @@ function prefsLoaded(changed){
   if(changed || !cloud.ready) refreshAfterCloud();
 }
 function refreshAfterCloud(){
-  if(cloud.mainLoaded && cloud.prefsLoaded) cloud.ready=true;
+  if(cloud.mainLoaded && cloud.prefsLoaded && !cloud.ready){
+    cloud.ready=true;
+    recordLogin(); // 読み込みが終わって画面を表示できた＝ログインできたので、今日の日付を記録する
+  }
   render();
+}
+// 最終ログイン日（今日の日付だけ。時刻は残さない）を lastLogin/{自分のID} に上書き保存する。
+// ここまで来るのは在籍中の人だけ（在籍中でない人は onMainSnapshot でログアウトになる）。
+// 記録に失敗しても（ルールをまだ公開していないときなど）アプリはそのまま使えるように、アラートは出さない
+function recordLogin(){
+  fs.doc('lastLogin/'+currentUserId).set({date:iso(new Date())})
+    .catch(err=>console.error('最終ログイン日を記録できませんでした', err));
+}
+// 管理者だけ、全員の最終ログイン日を受信する（「ログイン履歴」の画面で使う）。従業員はルールで読めないので受信しない
+function subscribeLastLogins(asAdmin){
+  if(cloud.lastLoginUnsub){ cloud.lastLoginUnsub(); cloud.lastLoginUnsub=null; }
+  cloud.lastLogins={}; cloud.lastLoginError=false;
+  if(!asAdmin) return;
+  cloud.lastLoginUnsub=fs.collection('lastLogin').onSnapshot(qs=>{
+    qs.docChanges().forEach(c=>{
+      if(c.type==='removed') delete cloud.lastLogins[c.doc.id];
+      else cloud.lastLogins[c.doc.id]=c.doc.data().date;
+    });
+    if(activeTab==='logins') render(); // 入力欄のない画面なので、表示中に描き直しても入力途中の内容が消えることはない
+  }, err=>{
+    // 読めなくてもログアウトはさせず（勤務希望などとは違い、無くてもアプリは使える）、画面で知らせるだけにする
+    console.error(err);
+    cloud.lastLoginError=true;
+    if(activeTab==='logins') render();
+  });
 }
 // 読み込めなかったとき（在籍中でない・削除された・通信エラーなど）はログアウトして理由を表示する
 function cloudReadError(err){
@@ -531,7 +566,24 @@ function defaultAvailFor(uid,dateIso){
 function fmtDate(isoStr){ const d=new Date(isoStr+'T00:00'); return `${d.getMonth()+1}/${d.getDate()}(${DOW[d.getDay()]})`; }
 function isoWeekKey(isoStr){ const d=new Date(isoStr+'T00:00'); const day=(d.getDay()+6)%7; d.setDate(d.getDate()-day); return iso(d); }
 
-/* ---------- シフトを公開したときに、対象期間・締切を次へ進めるための日付計算 ---------- */
+/* ---------- 希望提出締切 ---------- */
+// 締切は「対象期間の初日の何日前か」（1〜60の整数）。まだ設定していないデータ（日付で持っていた頃のデータなど）は既定値を使う
+function deadlineDaysBefore(){
+  const n=DB.settings.deadline_days_before;
+  return (Number.isInteger(n) && n>=1) ? n : DEFAULT_DEADLINE_DAYS_BEFORE;
+}
+// 対象期間の初日が periodStart のときの締切日（初日が未設定なら空文字）
+function deadlineDateOf(periodStart){
+  return periodStart ? isoAddDays(periodStart,-deadlineDaysBefore()) : '';
+}
+// 今の対象期間の締切を過ぎているか。締切日の当日はまだ受付中で、翌日から締切後になる。
+// 日付は 'YYYY-MM-DD' の文字列のまま比べる（桁数がそろっているので、文字列の大小＝日付の前後になる）
+function isAfterDeadline(){
+  const deadline=deadlineDateOf(DB.settings.period_start);
+  return deadline!=='' && iso(new Date())>deadline;
+}
+
+/* ---------- シフトを公開したときに、対象期間を次へ進めるための日付計算 ---------- */
 // isoStr の n か月後の同じ日。その月に同じ日が無ければ月末にそろえる（例：1/31 の1か月後 → 2/28）
 function addMonthsIso(isoStr,n){
   const d=new Date(isoStr+'T00:00');
@@ -545,29 +597,25 @@ function addMonthsIso(isoStr,n){
 function lastDayOfMonthIso(isoStr){ const d=new Date(isoStr+'T00:00'); return iso(new Date(d.getFullYear(), d.getMonth()+1, 0)); }
 // 2つの日付の差（日数）。Math.round で、時差などで端数が出ても整数にそろえる
 function daysBetween(a,b){ return Math.round((new Date(b+'T00:00')-new Date(a+'T00:00'))/86400000); }
-// 今の対象期間と締切から、次の対象期間と締切を求める。
+// 今の対象期間から、次の対象期間を求める。
 // 次の期間は必ず「今の期間の翌日」から始める（期間どうしにすき間や重なりを作らない）。
-//   ① 1か月単位（1日〜月末、21日〜翌月20日など）→ 次の1か月。締切は翌月の同じ日
+//   ① 1か月単位（1日〜月末、21日〜翌月20日など）→ 次の1か月
 //   ② 半月単位（1日〜15日 → 16日〜月末、16日〜月末 → 翌月1日〜15日）
 //   ③ それ以外（1週間・2週間など）→ 同じ日数で翌日から
-//   ②③の締切は「期間の開始日の何日前か」を保ったまま、開始日と同じ日数だけずらす
-function nextPeriodOf(start,end,deadline){
+// 締切日は初日から計算する（deadlineDateOf）ので、ここで求める必要はない。期間が進めば締切日も一緒に進む。
+function nextPeriodOf(start,end){
   const nextStart=isoAddDays(end,1);
-  const shiftDays=daysBetween(start,nextStart); // 開始日が何日ずれるか
-  // 締切日のずらし方（締切が未設定なら未設定のまま）
-  const deadlineByDays =()=> deadline ? isoAddDays(deadline,shiftDays) : '';
-  const deadlineByMonth=()=> deadline ? addMonthsIso(deadline,1) : '';
   if(isoAddDays(addMonthsIso(start,1),-1)===end){ // ① 1か月単位
-    return {start:nextStart, end:isoAddDays(addMonthsIso(nextStart,1),-1), deadline:deadlineByMonth()};
+    return {start:nextStart, end:isoAddDays(addMonthsIso(nextStart,1),-1)};
   }
   if(start.slice(8)==='01' && end.slice(8)==='15'){ // ② 半月単位（前半 → 後半）
-    return {start:nextStart, end:lastDayOfMonthIso(nextStart), deadline:deadlineByDays()};
+    return {start:nextStart, end:lastDayOfMonthIso(nextStart)};
   }
   if(start.slice(8)==='16' && end===lastDayOfMonthIso(start)){ // ② 半月単位（後半 → 翌月の前半）
-    return {start:nextStart, end:nextStart.slice(0,8)+'15', deadline:deadlineByDays()};
+    return {start:nextStart, end:nextStart.slice(0,8)+'15'};
   }
   const len=daysBetween(start,end)+1; // ③ 決まった日数（1週間・2週間など）
-  return {start:nextStart, end:isoAddDays(end,len), deadline:deadlineByDays()};
+  return {start:nextStart, end:isoAddDays(end,len)};
 }
 
 const toMin=t=>{ const [h,m]=t.split(':').map(Number); return h*60+m; };
@@ -1276,37 +1324,39 @@ function recomputeShortagesForDate(date){
    画面描画
    ============================================================ */
 const TABS_ADMIN=[
-  ['dash','① ダッシュボード'],
-  ['emps','② 従業員管理'],
-  ['need','③ 必要最低人数設定'],
-  ['deadline','④ 締切設定'],
-  ['make','⑤ シフト作成・確認'],
-  ['cal','⑥ シフトカレンダー'],
+  ['dash','ダッシュボード'],
+  ['emps','従業員管理'],
+  ['need','必要最低人数設定'],
+  ['deadline','締切設定'],
+  ['make','シフト作成・確認'],
+  ['cal','シフトカレンダー'],
+  ['logins','ログイン履歴'],
 ];
 const TABS_EMP=[
-  ['home','① 従業員ホーム'],
-  ['pref','② 勤務希望入力'],
-  ['myshift','③ 自分のシフト確認'],
+  ['home','従業員ホーム'],
+  ['pref','勤務希望入力'],
+  ['myshift','自分のシフト確認'],
 ];
 // 管理者でありながらPA種別（権限）も持つユーザー（例：寺嶋）が、自分の勤務希望を提出できるようにする追加タブ
 const TABS_ADMIN_STAFF_EXTRA=[
-  ['pref','⑦ 勤務希望入力（自分の分）'],
-  ['myshift','⑧ 自分のシフト確認'],
+  ['pref','勤務希望入力（自分の分）'],
+  ['myshift','自分のシフト確認'],
 ];
 function tabsFor(u){
   if(u.role==='admin') return isStaff(u) ? [...TABS_ADMIN, ...TABS_ADMIN_STAFF_EXTRA] : TABS_ADMIN;
   return TABS_EMP;
 }
 let activeTab='dash';
+let menuOpen=false; // 三本線メニューのページ一覧が開いているか
 
 function render(){
   const who=document.getElementById('who');
-  const tabsEl=document.getElementById('tabs');
+  const menuEl=document.getElementById('menu');
 
   // ログイン状態の確認中・共有データの読み込み中
   if(!cloud.authKnown || (currentUserId && !cloud.ready)){
     who.innerHTML='';
-    tabsEl.innerHTML='';
+    menuEl.innerHTML=''; menuOpen=false;
     document.getElementById('view').innerHTML=`<div class="card" style="max-width:420px;margin:40px auto;text-align:center">
       <p class="desc" style="margin:0">読み込み中…</p></div>`;
     return;
@@ -1314,7 +1364,7 @@ function render(){
   // 未ログイン → ログイン画面のみ
   if(!currentUser()){
     who.innerHTML='';
-    tabsEl.innerHTML='';
+    menuEl.innerHTML=''; menuOpen=false;
     document.getElementById('view').innerHTML=viewLogin();
     return;
   }
@@ -1327,18 +1377,34 @@ function render(){
 
   const tabs=tabsFor(u);
   if(!tabs.find(t=>t[0]===activeTab)) activeTab=tabs[0][0];
-  document.getElementById('tabs').innerHTML=tabs.map(([id,label])=>
-    `<button class="${id===activeTab?'active':''}" onclick="go('${id}')">${label}</button>`).join('');
+  // ロゴの左の三本線ボタンと、押すと開くページの一覧（今のページは active で色を変える）
+  menuEl.innerHTML=`
+    <button class="menu-btn" id="menuBtn" aria-label="メニュー" aria-controls="menuPanel" aria-expanded="${menuOpen}" onclick="toggleMenu()">
+      <span></span><span></span><span></span>
+    </button>
+    <nav class="menu-panel${menuOpen?' open':''}" id="menuPanel">
+      ${tabs.map(([id,label])=>`<button class="${id===activeTab?'active':''}" onclick="go('${id}')">${label}</button>`).join('')}
+    </nav>`;
 
   const v=document.getElementById('view');
   v.innerHTML=({
     dash:viewDash, emps:viewEmps, need:viewNeed, deadline:viewDeadline,
-    make:viewMake, cal:viewCal,
+    make:viewMake, cal:viewCal, logins:viewLogins,
     home:viewHome, pref:viewPref, myshift:viewMyShift
   }[activeTab])();
   if(window._afterRender){ window._afterRender(); window._afterRender=null; }
 }
-function go(id){ activeTab=id; render(); }
+function go(id){ activeTab=id; menuOpen=false; render(); }
+// 三本線メニューを開く・閉じる（open を省略すると、開いていれば閉じ、閉じていれば開く）。
+// render() で画面全体を描き直すと入力欄に打ちかけの内容が消えてしまうので、一覧の表示だけを切り替える
+function toggleMenu(open){
+  menuOpen = (open===undefined) ? !menuOpen : open;
+  document.getElementById('menuPanel').classList.toggle('open', menuOpen);
+  document.getElementById('menuBtn').setAttribute('aria-expanded', menuOpen);
+}
+// メニューの外をクリックしたとき・Esc キーを押したときは閉じる
+document.addEventListener('click', e=>{ if(menuOpen && !e.target.closest('#menu')) toggleMenu(false); });
+document.addEventListener('keydown', e=>{ if(menuOpen && e.key==='Escape') toggleMenu(false); });
 
 /* ---------- 管理者: ダッシュボード ---------- */
 function viewDash(){
@@ -1349,7 +1415,7 @@ function viewDash(){
   // 人員不足の合計（人時）＝「足りない人数 × その時間の長さ」をすべて足したもの（例：2人足りない状態が30分なら1人時）
   const shortPersonMin=shortagesInTarget().reduce((a,x)=>a+(x.required-x.assigned)*(toMin(x.end)-toMin(x.start)),0);
   const shortPersonHours=Math.round(shortPersonMin/6)/10; // 時間に直して小数第1位まで
-  const afterDeadline = iso(new Date())>s.deadline;
+  const afterDeadline = isAfterDeadline();
   const latestPub=latestPublishedPeriod();
   return `
   <div class="card">
@@ -1357,7 +1423,7 @@ function viewDash(){
     <p class="desc">従業員の勤務希望・希望休日・勤務可能時間と、時間帯ごとの必要最低人数を考慮して、シフトを自動作成します（営業時間は必要最低人数の設定範囲から決まります）。</p>
     <div class="kpi">
       <div class="box"><span class="note">対象期間</span><b>${fmtDate(s.period_start)}〜${fmtDate(s.period_end)}</b></div>
-      <div class="box"><span class="note">希望提出締切</span><b>${fmtDate(s.deadline)} ${afterDeadline?'<span class="pill bad">締切後</span>':'<span class="pill ok">受付中</span>'}</b></div>
+      <div class="box"><span class="note">希望提出締切</span><b>${fmtDate(deadlineDateOf(s.period_start))} ${afterDeadline?'<span class="pill bad">締切後</span>':'<span class="pill ok">受付中</span>'}</b></div>
       <div class="box"><span class="note">希望提出状況</span><b>${submitted.length} / ${emps.length} 名</b></div>
       <div class="box"><span class="note">人員不足</span><b>${shortPersonMin>0?`<span style="color:var(--bad)">${shortPersonHours} 人時</span>`:'<span style="color:var(--ok)">なし</span>'}</b></div>
       <div class="box"><span class="note">公開済みの最新シフト</span><b>${latestPub?`${fmtDate(latestPub.start)}〜${fmtDate(latestPub.end)}`:'<span class="pill muted">まだありません</span>'}</b></div>
@@ -1395,7 +1461,7 @@ function viewDash(){
 function viewEmps(){
   return `
   <div class="card">
-    <h2><span class="tag">4-1</span> 従業員管理機能</h2>
+    <h2>従業員管理機能</h2>
     <p class="desc">従業員の追加・編集・削除を行います。管理項目：氏名、ログイン情報、役職、権限（PA種別）、在籍状況。社員番号は追加時に自動発行されます。あとから管理者が変更することもできます（数字5桁以内・他の人と重複しない番号）。変更した場合、本人は次回から新しい番号でログインします。パスワードは本人がログイン画面の「初めてログインする」から設定します（安全のため、管理者はパスワードを見たり変更したりできません）。<br>
       管理者アカウント（登録者を含む）も削除できます。ただし、ログイン中の自分のアカウントと、ログインできる最後の1人の管理者は削除できません。</p>
     <div class="scroll"><table id="empTable">
@@ -1476,7 +1542,7 @@ function addUser(){ const n=document.getElementById('newName').value.trim(); if(
 function viewNeed(){
   return `
   <div class="card">
-    <h2><span class="tag">4-3</span> 必要最低動員人数設定機能</h2>
+    <h2>必要最低動員人数設定機能</h2>
     <p class="desc">時間帯ごとに必要な最低従業員数を設定します（全営業日に適用）。この人数は、誰かが休憩中であっても実際に働いている人数として満たされるよう、自動作成時に休憩の配置やカバー要員の追加で調整されます。営業時間設定は廃止したため、ここで設定した時間帯の最早開始〜最遅終了がそのまま営業時間として使われます。</p>
     <div class="scroll"><table>
       <tr><th>開始</th><th>終了</th><th>必要最低人数</th><th></th></tr>
@@ -1503,28 +1569,40 @@ function addNeed(){ DB.required_staff.push({id:'r'+Date.now(),start:'09:00',end:
 function viewDeadline(){
   const s=DB.settings;
   const validPeriod = s.period_start && s.period_end && s.period_start<=s.period_end;
-  const next = validPeriod ? nextPeriodOf(s.period_start,s.period_end,s.deadline) : null;
+  const next = validPeriod ? nextPeriodOf(s.period_start,s.period_end) : null;
+  const deadline = deadlineDateOf(s.period_start);
   return `
   <div class="card">
-    <h2><span class="tag">4-4</span> 希望提出締切設定機能 / 対象期間</h2>
-    <p class="desc">シフト対象期間と、勤務希望の提出締切日を設定します。締切日まで：従業員は編集可能／締切日以降：管理者のみ編集可能。</p>
-    <div class="banner ok">🔁 シフトを公開すると、対象期間と締切日は自動で次の期間に切り替わります。
-      ${next?`<br>次の切り替わり先：<b>${fmtDate(next.start)}〜${fmtDate(next.end)}</b>（締切 ${next.deadline?fmtDate(next.deadline):'未設定'}）`:''}</div>
+    <h2>希望提出締切設定機能 / 対象期間</h2>
+    <p class="desc">シフト対象期間と、勤務希望の提出締切を設定します。締切は「対象期間の初日の何日前か」で決まります。締切日の当日まで：従業員は編集可能／締切日の翌日から：管理者のみ編集可能。</p>
+    <div class="banner ok">🔁 シフトを公開すると、対象期間は自動で次の期間に切り替わり、締切日も同じ「初日の${deadlineDaysBefore()}日前」になります。
+      ${next?`<br>次の切り替わり先：<b>${fmtDate(next.start)}〜${fmtDate(next.end)}</b>（締切 ${fmtDate(deadlineDateOf(next.start))}）`:''}</div>
     <fieldset><legend>シフト対象期間</legend>
       <div class="row">
         <label>開始 <input type="date" value="${s.period_start}" onchange="setS('period_start',this.value)"></label>
         <label>終了 <input type="date" value="${s.period_end}" onchange="setS('period_end',this.value)"></label>
       </div>
     </fieldset>
-    <fieldset><legend>希望提出締切日</legend>
+    <fieldset><legend>希望提出締切</legend>
       <div class="row">
-        <input type="date" value="${s.deadline}" onchange="setS('deadline',this.value)">
+        <label>対象期間の初日の <input type="number" min="1" max="60" step="1" style="width:70px" value="${deadlineDaysBefore()}" onchange="setDeadlineDays(this.value)"> 日前</label>
         <span class="note">今日: ${iso(new Date())}</span>
       </div>
+      ${deadline?`<p class="note">今の対象期間の締切日：<b>${fmtDate(deadline)}</b>（この日まで従業員が入力でき、${fmtDate(isoAddDays(deadline,1))} から締切後になります）</p>`:''}
     </fieldset>
   </div>`;
 }
 function setS(f,v){ DB.settings[f]=v; save(); render(); }
+// 締切を「初日の何日前か」で設定する。空欄（Number('') は 0 になる）や小数などは受け付けず、元の値に戻す
+function setDeadlineDays(v){
+  const n=Number(v);
+  if(!Number.isInteger(n) || n<1 || n>60){
+    alert('締切は「初日の何日前か」を 1〜60 の整数で入力してください。');
+    render(); // 入力欄を元の値に戻す
+    return;
+  }
+  DB.settings.deadline_days_before=n; save(); render();
+}
 
 /* ---------- 管理者: シフト作成・確認 ---------- */
 function viewMake(){
@@ -1535,7 +1613,7 @@ function viewMake(){
   const latestPub=latestPublishedPeriod();
   return `
   <div class="card">
-    <h2><span class="tag">5</span> シフト自動作成機能</h2>
+    <h2>シフト自動作成機能</h2>
     <p class="desc">
       月初の日から1日ずつ、その日の分だけ次の1〜6をすべて終えてから翌日に進みます
       （週の実働時間・連続勤務日数は日をまたいで積み上げて判定します）。<br>
@@ -1553,7 +1631,7 @@ function viewMake(){
   </div>
 
   <div class="card">
-    <h2><span class="tag">5-3</span> 人員不足検知機能</h2>
+    <h2>人員不足検知機能</h2>
     ${short.length===0
       ? `<div class="banner ok">✅ 必要最低人数を満たしています（人員不足なし）</div>`
       : `<div class="banner warn">⚠️ ${short.length} 件の時間帯で人員が不足しています</div>
@@ -1565,7 +1643,7 @@ function viewMake(){
   </div>
 
   <div class="card">
-    <h2><span class="tag">6-3</span> シフト公開機能</h2>
+    <h2>シフト公開機能</h2>
     <p class="desc">公開前：従業員は自分のシフトを閲覧できません。公開後：従業員は自分のシフトを閲覧できます。<br>
       公開すると、締切設定（対象期間・締切日）は自動で次の期間に切り替わり、次の期間の勤務希望の受付が始まります。</p>
     <div class="row">
@@ -1607,9 +1685,9 @@ function publish(){
   if(DB.shifts.filter(x=>x.date>=s.period_start&&x.date<=s.period_end).length===0){ alert('先にシフトを作成してください。'); return; }
   if(shortagesInTarget().length>0 && !confirm('人員不足の時間帯があります。このまま公開しますか？')) return;
   // 公開済み期間の一覧に記録する（同じ期間を公開し直す場合は、古い記録と入れ替える）。
-  // 締切日と最終作成日時も一緒に覚えておき、「非公開に戻す」ときに元どおりにできるようにする。
+  // 最終作成日時も一緒に覚えておき、「非公開に戻す」ときに元どおりにできるようにする（締切日は初日から計算するので覚えなくてよい）。
   s.published_periods=publishedPeriods().filter(pp=>!(pp.start===s.period_start && pp.end===s.period_end));
-  s.published_periods.push({start:s.period_start, end:s.period_end, deadline:s.deadline,
+  s.published_periods.push({start:s.period_start, end:s.period_end,
     published_at:new Date().toLocaleString('ja-JP'), last_generated:s.last_generated||null});
   const publishedLabel=`${fmtDate(s.period_start)}〜${fmtDate(s.period_end)}`;
   moveTargetToNextPeriod();
@@ -1623,20 +1701,21 @@ function advanceToNextPeriod(){
   save(); render();
   alert(nextPeriodMessage());
 }
-// 対象期間と締切日を次の期間に切り替える（保存と再描画は呼び出し側で行う）
+// 対象期間を次の期間に切り替える（締切日は初日から計算するので一緒に進む。保存と再描画は呼び出し側で行う）
 function moveTargetToNextPeriod(){
   const s=DB.settings;
-  const next=nextPeriodOf(s.period_start,s.period_end,s.deadline);
-  s.period_start=next.start; s.period_end=next.end; s.deadline=next.deadline;
+  const next=nextPeriodOf(s.period_start,s.period_end);
+  s.period_start=next.start; s.period_end=next.end;
+  delete s.deadline; // 締切日を日付で保存していた頃の古い値。もう使わないので、クラウドに残して紛らわしくならないよう消す
   s.last_generated=null; // 次の期間はまだ自動作成していない
   calPeriodKey='target'; editingCell=null; // カレンダーは新しい対象期間の表示に戻す
 }
 // 切り替え後の対象期間・締切を知らせる文。締切日がもう過ぎていたら直すよう促す
 function nextPeriodMessage(){
   const s=DB.settings;
-  let msg=`締切設定を次の対象期間（${fmtDate(s.period_start)}〜${fmtDate(s.period_end)}、締切 ${s.deadline?fmtDate(s.deadline):'未設定'}）に切り替えました。`;
-  if(!s.deadline) msg+='\n※ 締切日が設定されていません。「④ 締切設定」で設定してください。';
-  else if(s.deadline<iso(new Date())) msg+='\n※ 新しい締切日はすでに過ぎています。「④ 締切設定」で締切日を直してください。';
+  const deadline=deadlineDateOf(s.period_start);
+  let msg=`締切設定を次の対象期間（${fmtDate(s.period_start)}〜${fmtDate(s.period_end)}、締切 ${fmtDate(deadline)}）に切り替えました。`;
+  if(deadline<iso(new Date())) msg+='\n※ 新しい締切日はすでに過ぎています。「締切設定」で「初日の何日前か」を見直してください。';
   return msg;
 }
 // 最後に公開した期間を非公開に戻す。締切設定（対象期間・締切日）もその期間に戻し、修正して公開し直せるようにする。
@@ -1647,11 +1726,42 @@ function unpublishLatest(){
   if(!latest) return;
   if(!confirm(`${fmtDate(latest.start)}〜${fmtDate(latest.end)} のシフトを非公開に戻します。\n締切設定（対象期間・締切日）もこの期間に戻ります。よろしいですか？`)) return;
   s.published_periods=publishedPeriods().filter(pp=>pp!==latest);
-  s.period_start=latest.start; s.period_end=latest.end;
-  if(latest.deadline) s.deadline=latest.deadline;
+  s.period_start=latest.start; s.period_end=latest.end; // 締切日は初日から計算するので、これで締切日も元に戻る
   s.last_generated=latest.last_generated||null;
   calPeriodKey='target'; editingCell=null;
   save(); render();
+}
+
+/* ---------- 管理者: ログイン履歴 ---------- */
+// 各アカウントの最終ログイン日だけを表示する（時刻は記録しない）。データは subscribeLastLogins で受信した cloud.lastLogins
+function viewLogins(){
+  const today=iso(new Date());
+  return `
+  <div class="card">
+    <h2>ログイン履歴</h2>
+    <p class="desc">各アカウントが最後にログインした日を表示します（時刻は記録していません）。ログイン中にページを開き直した場合も、その日のログインとして記録されます。</p>
+    ${cloud.lastLoginError?'<div class="banner warn">⚠️ 最終ログイン日を読み込めませんでした。Firebase のセキュリティルール（firestore.rules）が最新の内容で公開されているか確認してください。</div>':''}
+    <div class="scroll"><table>
+      <tr><th>氏名</th><th>社員番号</th><th>役職</th><th>最終ログイン日</th></tr>
+      ${DB.users.map(u=>{
+        const d=cloud.lastLogins[u.id];
+        return `<tr>
+          <td>${u.name} ${u.is_active?'':'<span class="pill muted">在籍外</span>'}</td>
+          <td>${u.empNo}</td>
+          <td>${roleLabel(u.role)}</td>
+          <td>${d ? `${fmtDate(d)} <span class="note">（${daysAgoLabel(d,today)}）</span>` : '<span class="pill muted">記録なし</span>'}</td>
+        </tr>`;
+      }).join('')}
+    </table></div>
+    <p class="note">この機能を追加する前のログインは記録されていないため、追加後に一度もログインしていない人は「記録なし」と表示されます。</p>
+  </div>`;
+}
+// 日付 d が today の何日前かを「今日」「昨日」「3日前」の形で返す
+function daysAgoLabel(d,today){
+  const n=daysBetween(d,today);
+  if(n===0) return '今日';
+  if(n===1) return '昨日';
+  return n+'日前';
 }
 
 /* ---------- 管理者/共通: シフトカレンダー ---------- */
@@ -1714,7 +1824,7 @@ function calendarHTML(editable){
   const editingBreak = editingCell && (DB.breaks||[]).find(x=>x.user_id===editingCell.userId && x.date===editingCell.date);
   return `
   <div class="card">
-    <h2><span class="tag">6-1</span> シフト表示機能（カレンダー形式）</h2>
+    <h2>シフト表示機能（カレンダー形式）</h2>
     <div class="row">
       <label>表示する期間
         <select onchange="selectCalPeriod(this.value)">
@@ -1828,14 +1938,14 @@ function viewHome(){
   const p=DB.employee_preferences[u.id]||{};
   const done=days.filter(d=>p[d]).length;
   const submitted=DB.submissions[u.id]===s.period_start;
-  const afterDeadline=iso(new Date())>s.deadline;
+  const afterDeadline=isAfterDeadline();
   const latestPub=latestPublishedPeriod();
   return `
   <div class="card">
-    <h2><span class="tag">3</span> 従業員ホーム（${u.name}）</h2>
+    <h2>従業員ホーム（${u.name}）</h2>
     <div class="kpi">
       <div class="box"><span class="note">対象期間</span><b>${fmtDate(s.period_start)}〜${fmtDate(s.period_end)}</b></div>
-      <div class="box"><span class="note">提出締切</span><b>${fmtDate(s.deadline)}</b> ${afterDeadline?'<span class="pill bad">締切後（編集不可）</span>':'<span class="pill ok">編集できます</span>'}</div>
+      <div class="box"><span class="note">提出締切</span><b>${fmtDate(deadlineDateOf(s.period_start))}</b> ${afterDeadline?'<span class="pill bad">締切後（編集不可）</span>':'<span class="pill ok">編集できます</span>'}</div>
       <div class="box"><span class="note">希望入力</span><b>${done} / ${days.length} 日</b> ${submitted?'<span class="pill ok">提出済み</span>':'<span class="pill warn">未提出</span>'}</div>
       <div class="box"><span class="note">公開済みの最新シフト</span><b>${latestPub?`${fmtDate(latestPub.start)}〜${fmtDate(latestPub.end)}`:'<span class="pill muted">未公開</span>'}</b></div>
     </div>
@@ -1850,14 +1960,13 @@ function viewHome(){
 function viewPref(){
   const s=DB.settings, u=currentUser();
   const days=rangeDates(s.period_start,s.period_end);
-  const afterDeadline=iso(new Date())>s.deadline;
-  const locked = afterDeadline && !isAdmin();
+  const locked = isAfterDeadline() && !isAdmin();
   DB.employee_preferences[u.id]=DB.employee_preferences[u.id]||{};
   const p=DB.employee_preferences[u.id];
   const submitted=DB.submissions[u.id]===s.period_start;
   return `
   <div class="card">
-    <h2><span class="tag">3-1</span> 勤務希望入力機能</h2>
+    <h2>勤務希望入力機能</h2>
     ${locked?'<div class="banner warn">⚠️ 提出締切を過ぎているため編集できません（管理者のみ編集可）</div>':''}
     ${u.permission==='dependent_student'?'<div class="banner ok">🎓 扶養学生PAのため、自動作成では「1日の勤務は8時間未満」「週の勤務時間は40時間未満」になるよう調整されます。</div>'
       :u.permission==='dependent'?'<div class="banner ok">📌 扶養PAのため、自動作成では「週の勤務時間が20時間未満」になるよう調整されます。</div>':''}
@@ -1974,7 +2083,7 @@ function selectMyShiftPeriod(key){ myShiftPeriodKey=key; render(); }
 function viewMyShift(){
   const u=currentUser();
   const list=publishedPeriods().slice().sort((a,b)=> a.start<b.start ? 1 : -1); // 新しい期間を上に
-  if(list.length===0) return `<div class="card"><h2><span class="tag">3-3</span> シフト確認機能</h2>
+  if(list.length===0) return `<div class="card"><h2>シフト確認機能</h2>
     <div class="banner warn">🔒 シフトはまだ公開されていません。公開までお待ちください。</div></div>`;
   const period=list.find(pp=>pp.start+'_'+pp.end===myShiftPeriodKey) || defaultMyShiftPeriod(list);
   const newer=list.filter(pp=>pp.start>period.start); // 表示中より後の期間も公開されていれば知らせる
@@ -1993,7 +2102,7 @@ function viewMyShift(){
   const totalWorkMin=totalShiftMin-totalBreakMin; // 実働＝シフトの長さの合計から休憩の合計を引いたもの
   const totalWorkText=`${Math.floor(totalWorkMin/60)}時間${totalWorkMin%60 ? (totalWorkMin%60)+'分' : ''}`;
   return `<div class="card">
-    <h2><span class="tag">3-3</span> 自分の勤務シフト（${u.name}）</h2>
+    <h2>自分の勤務シフト（${u.name}）</h2>
     <div class="row">
       <label>表示する期間
         <select onchange="selectMyShiftPeriod(this.value)">

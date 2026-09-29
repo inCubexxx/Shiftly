@@ -8,7 +8,8 @@
   body{margin:0;font-family:"Segoe UI","Hiragino Sans","Yu Gothic UI",Meiryo,sans-serif;
     background:var(--bg);color:var(--ink);font-size:14px;line-height:1.6}
   header.top{background:linear-gradient(90deg,#3a86e6,#2f7de1);color:#fff;padding:14px 20px;
-    display:flex;align-items:center;gap:14px;flex-wrap:wrap;box-shadow:var(--shadow)}
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap;box-shadow:var(--shadow);
+    position:relative} /* スマホでメニューの一覧をヘッダーの真下に出すときの基準（.menu-panel 参照） */
   header.top h1{font-size:18px;margin:0;font-weight:700}
   header.top h1 img{display:block;height:60px;width:auto}
   header.top .who{margin-left:auto;display:flex;gap:8px;align-items:center;font-size:13px}
@@ -24,9 +25,19 @@
   button.danger{background:var(--bad);border-color:var(--bad)}
   button.danger:hover{filter:brightness(.92)}
   .wrap{max-width:1180px;margin:0 auto;padding:18px}
-  nav.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px}
-  nav.tabs button{background:#fff;color:var(--sub);border:1px solid var(--line);font-weight:600}
-  nav.tabs button.active{background:var(--brand);color:#fff;border-color:var(--brand)}
+  /* 画面切り替えメニュー：ロゴの左の三本線ボタンを押すと、その真下に一覧が開く（.open が付いている間だけ表示） */
+  .menu{position:relative}
+  .menu-btn{background:transparent;border:1px solid rgba(255,255,255,.6);padding:9px 10px;border-radius:9px}
+  .menu-btn:hover,.menu-btn[aria-expanded="true"]{background:rgba(255,255,255,.18)}
+  .menu-btn span{display:block;width:22px;height:2px;margin:4px 0;background:#fff;border-radius:2px} /* 三本線の1本 */
+  .menu-panel{display:none;position:absolute;top:calc(100% + 8px);left:0;z-index:100;min-width:240px;
+    flex-direction:column;gap:2px;padding:6px;background:var(--card);
+    border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(31,95,176,.18)}
+  .menu-panel.open{display:flex}
+  .menu-panel button{background:transparent;color:var(--ink);border:none;text-align:left;
+    padding:9px 12px;border-radius:8px;white-space:nowrap}
+  .menu-panel button:hover{background:var(--soft)}
+  .menu-panel button.active{background:var(--brand);color:#fff} /* 今開いているページ */
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;
     margin-bottom:16px;box-shadow:var(--shadow)}
   .card h2{margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px}
@@ -68,9 +79,11 @@
     header.top h1 img{height:40px}
     header.top .who{margin-left:0;width:100%;justify-content:flex-end;flex-wrap:wrap;font-size:12px}
 
-    /* タブは折り返さず、横にスワイプして切り替える */
-    nav.tabs{flex-wrap:nowrap;overflow-x:auto;margin:0 -12px 12px;padding:0 12px 6px}
-    nav.tabs button{flex:0 0 auto;white-space:nowrap}
+    /* メニューの一覧は、指で押しやすいようにヘッダーのすぐ下に画面の幅いっぱいで開く。
+       .menu の position を static にすると、一覧の位置の基準が header.top になる */
+    .menu{position:static}
+    .menu-panel{top:100%;left:12px;right:12px;min-width:0;margin-top:6px}
+    .menu-panel button{padding:12px}
 
     .card{padding:14px 12px;border-radius:12px;margin-bottom:12px}
     fieldset{padding:8px 10px}

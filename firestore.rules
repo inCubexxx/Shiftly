@@ -3,7 +3,7 @@ rules_version = '2';
 // Firebase コンソールの「Firestore Database」→「ルール」に、このファイルの中身を貼り付けて「公開」する。
 //
 // ログインした人の内部ID は、ログイン用ID（「内部ID@ドメイン」の形）の @ より前の部分。
-// app/main の admins（管理者）・members（在籍中の人）の一覧と照らし合わせて判定する。
+// app/main の s（管理者）・members（在籍中の人）の一覧と照らし合わせて判定する。
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null && request.auth.token.email != null; }
@@ -40,6 +40,15 @@ service cloud.firestore {
     match /prefs/{userId} {
       allow read: if signedIn() && (myId() == userId || myId() in mainNow().admins);
       allow write: if signedIn() && ((myId() == userId && myId() in mainAfter().members) || myId() in mainAfter().admins);
+    }
+
+    // 最終ログイン日：読めるのは管理者だけ（管理画面の「ログイン履歴」で見る）。
+    // 書き込めるのは在籍中の本人が、自分の分の日付（date）1つを保存することだけ。削除はできない
+    match /lastLogin/{userId} {
+      allow read: if signedIn() && myId() in mainNow().admins;
+      allow create, update: if signedIn() && myId() == userId && myId() in mainNow().members
+        && request.resource.data.keys().hasOnly(['date']) && request.resource.data.date is string;
+      allow delete: if false;
     }
   }
 }
