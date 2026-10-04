@@ -13,8 +13,12 @@
   header.top h1{font-size:18px;margin:0;font-weight:700}
   header.top h1 img{display:block;height:60px;width:auto}
   header.top .who{margin-left:auto;display:flex;gap:8px;align-items:center;font-size:13px}
+  header.top .who .store-name{border:1px solid rgba(255,255,255,.6);border-radius:999px;padding:1px 10px;font-weight:700} /* ログイン中の店舗名 */
+  /* ログイン画面の「店舗：1234 〇〇店［変更］」 */
+  .store-box{display:flex;align-items:center;justify-content:space-between;gap:8px;
+    background:var(--soft);border-radius:10px;padding:8px 12px;margin:8px 0 12px}
   select,input,button{font:inherit}
-  select,input[type=date],input[type=number],input[type=time],input[type=text],input[type=email]{
+  select,input[type=date],input[type=number],input[type=time],input[type=text],input[type=email],input[type=password]{
     padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
   button{cursor:pointer;border:1px solid var(--brand);background:var(--brand);color:#fff;
     padding:7px 14px;border-radius:9px;font-weight:600;transition:.15s}
@@ -24,6 +28,14 @@
   button.mini{padding:3px 9px;font-size:12px;border-radius:7px}
   button.danger{background:var(--bad);border-color:var(--bad)}
   button.danger:hover{filter:brightness(.92)}
+  button:disabled{opacity:.45;cursor:not-allowed} /* 押せないボタンは薄く表示する */
+  /* 職務設定の並べ替えのつまみ（≡）。touch-action:none は、指で動かしたときに画面がスクロールしないようにするため */
+  .drag-handle{display:inline-block;cursor:grab;touch-action:none;user-select:none;font-size:20px;line-height:1;
+    padding:6px 12px;border-radius:8px;color:var(--sub)}
+  .drag-handle:hover,.drag-handle:focus{background:var(--soft);color:var(--brand);outline:none}
+  #dutyTable tr{transition:transform .12s} /* 移動先を空けるために、ほかの行がなめらかにずれる */
+  #dutyTable tr.dragging{transition:none;position:relative;z-index:2;cursor:grabbing}
+  #dutyTable tr.dragging td{background:var(--soft)} /* 掴んでいる行 */
   .wrap{max-width:1180px;margin:0 auto;padding:18px}
   /* 画面切り替えメニュー：ロゴの左の三本線ボタンを押すと、その真下に一覧が開く（.open が付いている間だけ表示） */
   .menu{position:relative}
@@ -56,6 +68,18 @@
   .off{background:#fbe9ec;color:var(--bad);font-weight:700}
   .work{background:#e9f2fd}
   .short{background:#fce4e8;color:var(--bad);font-weight:700}
+  .shift-time{line-height:1.3} /* シフトカレンダーの時刻（PA の人は「出勤 / - / 退勤」の3行） */
+  .shift-code{font-weight:700;font-size:1.05em} /* シフトカレンダーの社員の記号（A・B など） */
+  table.cal td > div + div{margin-top:6px} /* 1日に2本あるときの間 */
+  /* シフトカレンダーの列の背景色：平日は白、土曜は薄い青、日曜・祝日は薄い赤。文字は黒で、希望休の「公」だけ赤 */
+  table.cal th,table.cal td{white-space:nowrap} /* 期間が長くても、氏名などを1文字ずつ折り返さない（はみ出す分は横にスクロール） */
+  table.cal td{background:#fff}
+  table.cal th.sat,table.cal td.sat{background:#e8f1ff}
+  table.cal th.sun,table.cal td.sun{background:#ffe9e9}
+  table.cal th.sat{color:#1b4fa0}
+  table.cal th.sun{color:#b42318}
+  table.cal td.req-off{color:var(--bad)}
+  table.cal td.short{background:#fce4e8} /* 人員不足・休みが足りない人のマスは、今までどおり赤い背景 */
   .editable-cell{cursor:pointer}
   .editable-cell:hover{outline:2px solid var(--brand);outline-offset:-2px}
   .editable-cell.selected{outline:3px solid var(--brand-d);outline-offset:-3px}
