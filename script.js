@@ -4,7 +4,7 @@
      storeCodes/{店舗コード}              店舗コード → 店舗ID・店舗名（コードを指定した1件だけ誰でも読める）
      stores/{店舗ID}/app/main             店舗全体のデータ：従業員・必要人数・設定・シフト（書けるのは管理者）
      stores/{店舗ID}/prefs/{ユーザーID}    勤務希望（本人と管理者だけ）
-     stores/{店舗ID}/logins/{社員番号}     社員番号 → 内部ID（番号を指定した1件だけ誰でも読める）
+     stores/{店舗ID}/logins/{ハッシュ値}   社員番号のハッシュ値 → 内部ID（ログインの照合用。1件だけ誰でも読める）
      stores/{店舗ID}/lastLogin/{ユーザーID} 最終ログイン日（読めるのは管理者だけ）
    ・店舗コードではなく、変わらない店舗IDの下に置く → 店舗コードを変えてもデータを移さなくて済む
    ・勤務希望を人ごとに分ける → 何人かが同時に提出しても、ほかの人の希望を上書きしない
@@ -42,7 +42,7 @@ const cloud={
   mainLoaded:false, prefsLoaded:false,
   mainJson:null,       // 最後にクラウドと一致していた内容（変わった部分だけ送るための比較用）
   prefsJson:{},        // userId -> 同上
-  logins:{},           // 社員番号 -> 内部ID（同上）
+  logins:{},           // ログイン照合用の鍵（社員番号のハッシュ値）-> 内部ID（同上）
   mainUnsub:null, prefsUnsub:null, lastLoginUnsub:null, // リアルタイム受信を止める関数
   prefsAsAdmin:null,   // 勤務希望を「全員分（管理者）」「自分の分」のどちらで受信しているか
   lastLogins:{},       // userId -> 最終ログイン日 'YYYY-MM-DD'（管理者だけ受信する。DB には入れないので save() では送らない）
@@ -234,11 +234,60 @@ function mainDocOf(part){
     admins: part.users.filter(u=>u.role==='admin' && u.is_active).map(u=>u.id),
     members: part.users.filter(u=>u.is_active).map(u=>u.id)};
 }
-// 社員番号 → 内部ID の対応（在籍中の人だけ）。クラウドには店舗の logins/{社員番号} に1件ずつ置く
-function loginsOf(src){
+// ログイン照合用の鍵：店舗ID と社員番号をつないだ文字列を SHA-256 でハッシュ化した値（16進数64文字）。
+// ハッシュ化は一方向の変換なので、鍵から社員番号には戻せない。ログインのときは、入力された番号を同じ方法で
+// ハッシュ化して探せば照合できる。店舗ID を混ぜる（ソルトの代わり）ので、同じ社員番号でも店舗ごとに違う鍵になる。
+// crypto.subtle（ブラウザに入っている暗号の機能）は結果を Promise で返すので、async 関数にしている
+async function loginKeyOf(storeId, empNo){
+  const bytes=new TextEncoder().encode(storeId+':'+empNo); // 文字列をバイト列にする
+  const digest=await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(b=>b.toString(16).padStart(2,'0')).join(''); // 1バイトずつ2桁の16進数にする
+}
+// ログイン照合用の鍵 → 内部ID の対応（在籍中の人だけ）。クラウドには店舗の logins/{鍵} に1件ずつ置く
+async function loginsOf(storeId, users){
   const m={};
-  (src.users||[]).filter(u=>u.is_active).forEach(u=>{ m[u.empNo]=u.id; });
+  for(const u of users.filter(u=>u.is_active)) m[await loginKeyOf(storeId, u.empNo)]=u.id;
   return m;
+}
+// logins に関わる処理は、ハッシュ化を待つ必要があるので、順番待ちの列（loginsQueue）に並べて1つずつ行う。
+// 続けて保存したときに、後の処理が先に終わって古い内容で上書きされるのを防ぐため
+let loginsQueue=Promise.resolve();
+function queueLogins(task){
+  loginsQueue=loginsQueue.then(task).catch(err=>console.error(err)); // 失敗しても、後に並んだ処理は続ける
+}
+// クラウドの logins と同じ内容を cloud.logins に覚える（logins は app/main の従業員一覧と同じ内容で保存されている）
+function setLoginsBaseline(){
+  const storeId=currentStore.id, users=clean(DB.users); // 呼んだ時点の内容を使う（ハッシュ化を待つ間に DB が変わってもずれないように）
+  queueLogins(async ()=>{ cloud.logins=await loginsOf(storeId, users); });
+}
+// 社員番号の追加・変更・在籍の変更があった分だけ logins を書き換える
+function syncLogins(){
+  const storeId=currentStore.id, users=clean(DB.users);
+  queueLogins(async ()=>{
+    const logins=await loginsOf(storeId, users);
+    Object.keys({...cloud.logins, ...logins}).forEach(key=>{
+      if(cloud.logins[key]===logins[key]) return;
+      const ref=fs.doc('stores/'+storeId+'/logins/'+key);
+      cloudWrite(logins[key] ? ref.set({uid:logins[key]}) : ref.delete());
+    });
+    cloud.logins=logins;
+  });
+}
+// 社員番号をそのまま文書名にしていたころの店舗（古い形）の logins を、ハッシュ化した形に移し替える。
+// 書き換えられるのは管理者だけなので、管理者がアプリを開いたときに行う（refreshAfterCloud）。
+// 古い形なら在籍中の全員分の文書があるので、自分の社員番号の文書が残っているかで判断する。
+// すべての店舗で移し替えが終わったら、この関数と lookupLogin の「古い形で探す」部分は消してよい
+function migrateLogins(){
+  const storeId=currentStore.id, users=clean(DB.users), me=currentUser();
+  queueLogins(async ()=>{
+    const base='stores/'+storeId+'/logins/';
+    if(!(await fs.doc(base+me.empNo).get()).exists) return; // 移し替え済み（または新しい形で作った店舗）
+    // 新しい形の文書を作るのと、古い形の文書を消すのを、一括書き込みでまとめて行う（途中で失敗しても中途半端にならない）
+    const batch=fs.batch();
+    Object.entries(await loginsOf(storeId, users)).forEach(([key,uid])=>batch.set(fs.doc(base+key), {uid}));
+    users.forEach(u=>batch.delete(fs.doc(base+u.empNo)));
+    await batch.commit();
+  });
 }
 // その人の勤務希望の保存場所（prefs/{userId}）に送る部分を取り出す
 function prefsPartOf(src,uid){
@@ -259,14 +308,7 @@ function save(){
   if(admin){
     const main=mainPartOf(DB), json=stableStringify(main);
     if(json!==cloud.mainJson){ cloud.mainJson=json; cloudWrite(fs.doc(storePath('app/main')).set(mainDocOf(main))); }
-    // 社員番号の追加・変更・在籍の変更があった分だけ logins を書き換える
-    const logins=loginsOf(DB);
-    Object.keys({...cloud.logins, ...logins}).forEach(no=>{
-      if(cloud.logins[no]===logins[no]) return;
-      const ref=fs.doc(storePath('logins/'+no));
-      cloudWrite(logins[no] ? ref.set({uid:logins[no]}) : ref.delete());
-    });
-    cloud.logins=logins;
+    syncLogins();
   }
   // 勤務希望：従業員は自分の分だけ、管理者は全員分（削除した人の分は消す）
   const ids = admin ? [...new Set([...Object.keys(cloud.prefsJson), ...DB.users.map(u=>u.id)])] : [me.id];
@@ -310,7 +352,7 @@ function onMainSnapshot(snap){
     Object.assign(DB, part);
     DB.shifts=DB.shifts||[]; DB.required_staff=DB.required_staff||[];
     cloud.mainJson=json;
-    cloud.logins=loginsOf(DB); // logins は app/main の従業員一覧と同じ内容で保存されている
+    setLoginsBaseline();
   }
   const me=currentUser();
   if(!me || !me.is_active){ cloudReadError({code:'permission-denied'}); return; }
@@ -379,7 +421,10 @@ function refreshAfterCloud(){
   if(cloud.mainLoaded && cloud.prefsLoaded && !cloud.ready){
     cloud.ready=true;
     recordLogin(); // 読み込みが終わって画面を表示できた＝ログインできたので、今日の日付を記録する
-    if(cloud.prefsAsAdmin===true && pruneOldData()) save(); // 管理者が開いたときだけ、古いデータを消す
+    if(cloud.prefsAsAdmin===true){ // 管理者が開いたときだけ、古い形の logins を移し替え、古いデータを消す
+      migrateLogins();
+      if(pruneOldData()) save();
+    }
   } else if(activeTab==='password'){
     return; // パスワード変更の画面はクラウドのデータを表示しないので、描き直さない（入力途中のパスワードが消えないように）
   }
@@ -429,7 +474,7 @@ async function createStoreData(store, admin){
   const batch=fs.batch();
   batch.set(fs.doc('storeCodes/'+store.code), {storeId:store.id, name:store.name});
   batch.set(fs.doc(base+'app/main'), mainDocOf(mainPartOf(src)));
-  Object.entries(loginsOf(src)).forEach(([no,uid])=>batch.set(fs.doc(base+'logins/'+no), {uid}));
+  Object.entries(await loginsOf(store.id, src.users)).forEach(([key,uid])=>batch.set(fs.doc(base+'logins/'+key), {uid}));
   await batch.commit();
 }
 
@@ -653,11 +698,13 @@ function authErrorMessage(e){
   if(c==='auth/api-key-not-valid.-please-pass-a-valid-api-key.' || c==='auth/invalid-api-key') return 'Firebase の設定（apiKey）が正しくありません。script.js の firebaseConfig を確認してください。';
   return 'エラーが発生しました（'+(c || (e && e.message) || '不明')+'）';
 }
-// 今選んでいる店舗の中で、社員番号から内部IDを調べる
+// 今選んでいる店舗の中で、社員番号から内部IDを調べる（社員番号をハッシュ化した鍵で探す）
 async function lookupLogin(empNo){
   // 数字以外（「/」など）が入ると保存場所の指定がおかしくなるので、先に形を確かめる
   if(!/^[0-9]{1,7}$/.test(empNo)) throw appError('社員番号は数字7桁以内で入力してください。');
-  const login=await fs.doc(storePath('logins/'+empNo)).get();
+  let login=await fs.doc(storePath('logins/'+await loginKeyOf(currentStore.id, empNo))).get();
+  // 古い形（社員番号をそのまま文書名にしていたころ）の店舗は、管理者が開いて移し替えるまで（migrateLogins）こちらで探す
+  if(!login.exists) login=await fs.doc(storePath('logins/'+empNo)).get();
   if(!login.exists) throw appError('この店舗に、その社員番号の人は登録されていません。店舗と社員番号を確認してください。');
   return login.data().uid;
 }
